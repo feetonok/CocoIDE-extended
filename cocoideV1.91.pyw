@@ -110,20 +110,35 @@ import random
 random.seed()
 import time
 import os
+import re
 import sys
 import signal
+import subprocess
 import io
 from sys import platform
 import collections as colls
 import atexit
 import codecs
 import copy
-import pyclbr
+try:
+    import pyclbr
+except ImportError:  # Python >= 3.13 removed pyclbr
+    pyclbr = None
 
+# Make sure we can find our own modules when frozen / launched by Finder
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):  # PyInstaller bundle
+    _APP_DIR = getattr(sys, "_MEIPASS", _APP_DIR)
+    if _APP_DIR not in sys.path:
+        sys.path.insert(0, _APP_DIR)
 
 # Language hightlight/syntax definitions
 #from cdm8_asm_config import *
 import cdm8_asm as cf
+
+# CocoIDE-extended: modern IDE helpers (autocomplete, tooltips, error hints,
+# project browser, animation)
+import ide_features as idf
 # Compiler/linker
 import cocas
 #import cocol
