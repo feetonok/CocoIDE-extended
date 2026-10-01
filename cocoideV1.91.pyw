@@ -1054,9 +1054,18 @@ class CocoIDE(tk.Frame):
 
         # Build the project file browser sidebar (VS Code style Explorer)
         self._buildProjectBrowser()
+        # Restore expanded folders from last session (only those inside root)
+        savedExp = [p for p in getattr(self, "_savedExpandedDirs", [])
+                    if os.path.isdir(p)]
         # Reopen last session's project (if it still exists)
         if self.projectPath and os.path.isdir(self.projectPath):
             self.set_project(self.projectPath, startup=True)
+            for p in savedExp:
+                rp = self.rootProjectPath or ""
+                if rp and (p == rp or p.startswith(rp + os.sep)):
+                    self.expandedDirs.add(p)
+            if savedExp:
+                self._populateProjectTree()
         elif self.recentProjects:
             for p in self.recentProjects:
                 if os.path.isdir(p):
@@ -2176,6 +2185,7 @@ class CocoIDE(tk.Frame):
                 if rp and os.path.isdir(rp):
                     self.projectPath = rp
                     self.rootProjectPath = rp
+            self._savedExpandedDirs = [p for p in cfg.get("expandedDirs", [])]
             if "autocomplete" in cfg:
                 self.acEnabled = bool(cfg["autocomplete"])
         except Exception:
@@ -2194,8 +2204,9 @@ class CocoIDE(tk.Frame):
                 pass
             cfg = {"recentProjects": self.recentProjects[:10],
                    "recentFiles": self.openedFiles[:15],
-                   "project": self.projectPath or "",
+                   "project": self.rootProjectPath or "",
                    "rootProject": self.rootProjectPath or "",
+                   "expandedDirs": sorted(self.expandedDirs)[:40],
                    "startupFolder": self.startupFolder or "",
                    "autocomplete": bool(getattr(self, "acEnabled", True)),
                    "windowGeom": geom}
@@ -2262,9 +2273,13 @@ class CocoIDE(tk.Frame):
         if not os.path.isdir(folder):
             messagebox.showerror("Project", "Folder not found:\n" + folder)
             return
+        same_root = (folder == self.rootProjectPath)
         self.projectPath = folder
         self.rootProjectPath = folder
-        self.expandedDirs = {folder}   # auto-expand the root itself
+        if not same_root:
+            self.expandedDirs = {folder}   # auto-expand the root itself
+        else:
+            self.expandedDirs.add(folder)  # keep previously expanded sub-folders
         self.startupFolder = folder
         if folder not in self.recentProjects:
             self.recentProjects.insert(0, folder)
@@ -2489,6 +2504,36 @@ class CocoIDE(tk.Frame):
         m.tk_popup(event.x_root, event.y_root)
         return "break"
 
+    def revealInTree(self, filepath):
+        """Expand every ancestor folder of *filepath* inside the tree (root
+        stays untouched), highlight the active file and scroll it into view."""
+        root = self.rootProjectPath or self.projectPath
+        if not root:
+            return
+        d = os.path.dirname(os.path.abspath(filepath))
+        guard = 0
+        while d and d.startswith(root) and d != root and guard < 40:
+            self.expandedDirs.add(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+            guard += 1
+        self._populateProjectTree()
+        # scroll the row of the currently-open file into view
+        try:
+            for child in self.projFrame.winfo_children():
+                txt = child.cget("text")
+                if isinstance(txt, str) and txt.strip().lstrip("\u25CF").strip() \
+                        == os.path.basename(filepath):
+                    self.projCanvas.update_idletasks()
+                    total = max(1, self.projFrame.winfo_reqheight())
+                    frac = child.winfo_y() / float(total)
+                    self.projCanvas.yview_moveto(max(0.0, min(frac - 0.1, 1.0)))
+                    break
+        except Exception:
+            pass
+
     def new_file_in_dir(self, dirpath):
         """Create a new .asm file inside dirpath and open it in the editor."""
         filepath = filedialog.asksaveasfilename(title="New File in Folder",
@@ -2507,16 +2552,7 @@ class CocoIDE(tk.Frame):
             messagebox.showerror("New File", "Could not create file:\n%s" % e)
             return
         self.file_new()
-        self.file_open(filepath=filepath)
-        # make sure the containing folder is visible in the tree
-        d = os.path.dirname(filepath)
-        while d and d.startswith(str(self.rootProjectPath or "")):
-            self.expandedDirs.add(d)
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        self._populateProjectTree()
+        self.file_open(filepath=filepath)   # reveals the path in the tree too
 
     def _populateProjectTree(self, event=None):
         """Fill the sidebar with the *full* project tree under the opened root
@@ -3439,14 +3475,24 @@ class CocoIDE(tk.Frame):
                     self.changed=True
                     self.highlighter()
                     self.asstxt.see("1.0")
-                    # Track recents & auto-open the containing folder as project
+                    # Track recents. Opening a file NEVER replaces the project
+                    # root (VS Code behaviour): we only expand the tree so the
+                    # opened file's folder is visible and the file is marked.
                     if filepath not in self.openedFiles:
                         self.openedFiles.insert(0, filepath)
                     self.openedFiles = self.openedFiles[:15]
                     folder = os.path.dirname(filepath)
-                    if folder != self.projectPath:
+                    root = self.rootProjectPath or self.projectPath
+                    if root and folder.startswith(root + os.sep):
+                        # inside the current project - just reveal it in place
+                        self.revealInTree(filepath)
+                    elif not root:
+                        # no project open yet: adopt the file's folder as root
                         self.set_project(folder)
+                        self.revealInTree(filepath)
                     else:
+                        # file lives outside the project: keep the project as is,
+                        # just refresh the recent-files menu
                         self._rebuildRecentMenu()
                         self._populateProjectTree()
                     self.saveConfig()
