@@ -1,0 +1,72 @@
+66 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.8
+66 INFO: Python: 3.12.10
+68 INFO: Platform: Linux-4.19.91-c8dfc93.al7.x86_64-x86_64-with-glibc2.36
+68 INFO: Python environment: /workspace/.venv-build
+68 INFO: wrote build/CocoIDE.spec
+69 INFO: Removing temporary files and cleaning cache in /root/.cache/pyinstaller
+71 INFO: Module search paths (PYTHONPATH):
+['/workspace',
+ '/usr/local/lib/python312.zip',
+ '/usr/local/lib/python3.12',
+ '/usr/local/lib/python3.12/lib-dynload',
+ '/workspace/.venv-build/lib/python3.12/site-packages',
+ '/workspace']
+243 INFO: Appending 'datas' from .spec
+243 INFO: checking Analysis
+243 INFO: Building Analysis because Analysis-00.toc is non existent
+243 INFO: Looking for Python shared library...
+249 INFO: Using Python shared library: /usr/local/lib/libpython3.12.so.1.0
+249 INFO: Running Analysis Analysis-00.toc
+249 INFO: Target bytecode optimization level: 0
+249 INFO: Initializing module dependency graph...
+250 INFO: Initializing module graph hook caches...
+259 INFO: Analyzing modules for base_library.zip ...
+1002 INFO: Processing standard module hook 'hook-heapq.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+1123 INFO: Processing standard module hook 'hook-encodings.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+2794 INFO: Processing standard module hook 'hook-math.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+3274 INFO: Processing standard module hook 'hook-pickle.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+4913 INFO: Caching module dependency graph...
+4961 INFO: Analyzing /workspace/cocoideV1.91.pyw
+5152 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks/pre_find_module_path'
+5153 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+5385 INFO: Processing standard module hook 'hook-_tkinter.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+6069 INFO: Processing standard module hook 'hook-platform.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+6123 INFO: Processing standard module hook 'hook-webbrowser.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+6146 INFO: Processing module hooks (post-graph stage)...
+6147 INFO: Processing standard module hook 'hook-_tkinter.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks'
+6158 INFO: Performing binary vs. data reclassification (319 entries)
+6166 INFO: Looking for ctypes DLLs
+6172 INFO: Analyzing run-time hooks ...
+6173 INFO: Including run-time hook 'pyi_rth_inspect.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks/rthooks'
+6176 INFO: Including run-time hook 'pyi_rth__tkinter.py' from '/workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/hooks/rthooks'
+6192 INFO: Creating base_library.zip...
+6242 INFO: Looking for dynamic libraries
+6606 INFO: Warnings written to /workspace/build/CocoIDE/warn-CocoIDE.txt
+6619 INFO: Graph cross-reference written to /workspace/build/CocoIDE/xref-CocoIDE.html
+6636 INFO: checking PYZ
+6636 INFO: Building PYZ because PYZ-00.toc is non existent
+6636 INFO: Building PYZ (ZlibArchive) /workspace/build/CocoIDE/PYZ-00.pyz
+6835 INFO: Building PYZ (ZlibArchive) /workspace/build/CocoIDE/PYZ-00.pyz completed successfully.
+6843 INFO: checking PKG
+6843 INFO: Building PKG because PKG-00.toc is non existent
+6843 INFO: Building PKG (CArchive) CocoIDE.pkg
+6936 INFO: Building PKG (CArchive) CocoIDE.pkg completed successfully.
+6936 INFO: Bootloader /workspace/.venv-build/lib/python3.12/site-packages/PyInstaller/bootloader/Linux-64bit-intel/run
+6936 INFO: checking EXE
+6936 INFO: Building EXE because EXE-00.toc is non existent
+6936 INFO: Building EXE from EXE-00.toc
+6937 INFO: Copying bootloader EXE to /workspace/build/CocoIDE/CocoIDE
+6937 INFO: Appending PKG archive to custom ELF section in EXE
+6944 INFO: Building EXE from EXE-00.toc completed successfully.
+6950 INFO: checking COLLECT
+6950 INFO: Building COLLECT because COLLECT-00.toc is non existent
+6950 INFO: Removing dir /workspace/dist/CocoIDE
+6960 INFO: Building COLLECT COLLECT-00.toc
+7044 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+7049 INFO: Build complete! The results are available in: /workspace/dist
+Installing PyInstaller ...
++ /workspace/.venv-build/bin/python -m pip --quiet --disable-pip-version-check install --upgrade pip
++ /workspace/.venv-build/bin/python -m pip --quiet --disable-pip-version-check install pyinstaller
++ /workspace/.venv-build/bin/python -m PyInstaller --noconfirm --clean --name CocoIDE --windowed --distpath dist --workpath build --specpath build --add-data /workspace/standard.mlb:. --add-data /workspace/sendfile.py:. --add-data /workspace/cocol.py:. --hidden-import cdm8_asm --hidden-import cocas --hidden-import cdm8_emu --hidden-import cdm8_io --hidden-import sendfile --hidden-import cocol cocoideV1.91.pyw
+
+DONE. Run:  dist/CocoIDE/CocoIDE
