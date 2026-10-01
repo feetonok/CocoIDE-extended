@@ -339,6 +339,8 @@ class CocoIDE(tk.Frame):
         self.changed = False
         ## Project / recent-files management (modern IDE style)
         self.projectPath = None       # currently open project folder (abs path)
+        self.rootProjectPath = None   # top-level folder opened as project (VS Code style)
+        self.expandedDirs = set()     # folders currently expanded in the tree browser
         self.recentProjects = []      # most recent first
         self.openedFiles = []         # abs paths of files opened this session
         self.configDir = os.path.join(USERDIR, ".cocoide")
@@ -534,19 +536,24 @@ class CocoIDE(tk.Frame):
         self.editButtons = tk.Frame(buttonBar)
         self.editButtons.pack(side=tk.LEFT, fill=tk.BOTH)
         # Modern minimal toolbar: New / Open (files & folders menu) / Save / Save As / Quit.
+        # Row 0: New / Open... / Save / Save As... / Quit (one per grid cell)
         self.newButton = tk.Button(self.editButtons, text="+ New", command=self.file_new)
-        self.newButton.grid(row=0, column=0, rowspan=2, sticky="ns", padx=1)
+        self.newButton.grid(row=0, column=0, sticky="ns", padx=1)
         self.openButton = tk.Button(self.editButtons, text="Open...")
-        self.openButton.grid(row=0, column=1, rowspan=2, sticky="ns", padx=1)
+        self.openButton.grid(row=0, column=1, sticky="ns", padx=1)
         self.openButton.bind("<Button-1>", self.show_open_menu)
         self.saveButton = tk.Button(self.editButtons, text="Save", command=self.file_save)
-        self.saveButton.grid(row=0, column=2, rowspan=2, sticky="ns", padx=1)
+        self.saveButton.grid(row=0, column=2, sticky="ns", padx=1)
         self.saveAsButton = tk.Button(self.editButtons, text="Save As...")
-        self.saveAsButton.grid(row=0, column=3, rowspan=2, sticky="ns", padx=1)
+        self.saveAsButton.grid(row=0, column=3, sticky="ns", padx=1)
         self.saveAsButton.bind("<Button-1>", lambda e: self.file_save_as())
         self.exitButton = tk.Button(self.editButtons, text="Quit", command=self.close_window)
-        self.exitButton.grid(row=0, column=5, rowspan=2, sticky="ns", padx=1)
+        self.exitButton.grid(row=0, column=4, sticky="ns", padx=1)
 
+        # Row 1: Find box + Search | Go-to-line box.
+        # (Previously the "Search" button was grid'ed into the SAME cell as
+        # "+ New" and "Line" overlapped the spacer next to "Quit" - buttons
+        # printed on top of each other at small window widths.)
         self.searchBox = tk.Entry(self.editButtons, width=10, fg="grey")
         self.searchPlaceholder = "Find..."
         self.searchBox.insert(0, self.searchPlaceholder)
@@ -554,16 +561,14 @@ class CocoIDE(tk.Frame):
         self.searchBox.bind("<FocusOut>", self._searchFocusOut)
         self.searchBox.bind("<Return>", self.searchText)
         self.searchBox.bind("<Button-3>", self.searchText)
-        tk.Button(self.editButtons, text="Search", command=self.searchText).grid(row=1, column=0, sticky="ew")
-        self.searchBox.grid(row=1, column=1, sticky="ew", columnspan=2)
-        
-        self.lineBox = tk.Entry(self.editButtons, width=3)
+        self.lineBox = tk.Entry(self.editButtons, width=5)
         self.lineBox.bind("<Return>", self.gotoLine)
         self.lineBox.bind("<Button-3>", self.gotoLine)
-        tk.Button(self.editButtons, text="Line", command=self.gotoLine).grid(row=1, column=3, sticky="w")
+        tk.Label(self.editButtons, text="Go:").grid(row=1, column=0, sticky="e")
+        self.searchBox.grid(row=1, column=1, columnspan=2, sticky="ew")
+        tk.Button(self.editButtons, text="Search", command=self.searchText).grid(row=1, column=3, sticky="ew")
         self.lineBox.grid(row=1, column=4, sticky="ew")
-        # Spacer
-        tk.Label(self.editButtons, text=" ", width=1).grid(row=1, column=6)
+        tk.Button(self.editButtons, text="Line", command=self.gotoLine).grid(row=1, column=5, sticky="w")
 
         ## CDM8 Emulator Buttons
         # Cludge for Mac button display!!!
@@ -742,6 +747,15 @@ class CocoIDE(tk.Frame):
         # accepts a suggestion when the popup is visible and indents otherwise.
         self.asstxt.bind("<Tab>", self._acTabHandler, add="+")
         self.asstxt.bind("<Return>", lambda e: self.acAccept(), add="+")
+        # Explicit widget-level bindings for popup navigation. The <Key> filter
+        # alone is not enough: Tk's built-in Text bindings for Up/Down/Escape
+        # run first and move the caret / close dialogs before we can "break"
+        # them (bindtags order), so the popup would never be navigable.
+        self.asstxt.bind("<Up>", lambda e: self.acMoveSel(-1))
+        self.asstxt.bind("<Down>", lambda e: self.acMoveSel(1))
+        # Escape: close the popup first (clearEditorHighlights below is bound
+        # with add="+" and only runs when acCancel returns None, i.e. closed).
+        self.asstxt.bind("<Escape>", self.acCancel)
         # Autocomplete trigger (VS Code style). Use lowercase 'space' keysym
         # and _safeBind: some Tk builds (e.g. python.org 3.14) don't know
         # the capitalized "Space" keysym and would crash startup otherwise.
@@ -1024,9 +1038,19 @@ class CocoIDE(tk.Frame):
             try:
                 self.master.geometry(self.savedWindowGeom)
             except tk.TclError:
-                self.master.geometry("1200x700")
+                self.master.geometry(self._defaultGeometry())
         else:
-            self.master.geometry("1200x700")
+            self.master.geometry(self._defaultGeometry())
+        # Never let the window be larger than the screen (toolbar buttons
+        # used to get clipped/overlapped on smaller displays)
+        try:
+            sw, sh = self.master.winfo_screenwidth(), self.master.winfo_screenheight()
+            self.master.minsize(min(1000, sw - 60), min(600, sh - 120))
+            self.update_idletasks()
+            if self.master.winfo_width() > sw - 40 or self.master.winfo_height() > sh - 80:
+                self.master.geometry(self._defaultGeometry())
+        except Exception:
+            pass
 
         # Build the project file browser sidebar (VS Code style Explorer)
         self._buildProjectBrowser()
@@ -1317,6 +1341,16 @@ class CocoIDE(tk.Frame):
         # Enable load/save menus
         self.menubar.entryconfig("File", state=tk.NORMAL)
 
+    def _defaultGeometry(self):
+        """Default window size: generous, but never exceeds the screen."""
+        try:
+            sw, sh = self.master.winfo_screenwidth(), self.master.winfo_screenheight()
+        except Exception:
+            sw, sh = 1400, 900
+        w = max(1000, min(1300, sw - 80))
+        h = max(640, min(820, sh - 130))   # leave room for menubar/dock
+        return "%dx%d+40+60" % (w, h)
+
     def bindKeys(self):
         # Bind editing keys
         self.asstxt.unbind("<Control-Tab>")
@@ -1345,7 +1379,11 @@ class CocoIDE(tk.Frame):
             self.asstxt.bind("<Control-v>", self.paste)
             self.asstxt.bind("<Control-V>", self.paste)
         
-        self.asstxt.bind("<Tab>", lambda e: self.tabBlock(shift=1))
+        # NOTE: <Tab>/<Return> are bound once in __init__ (add="+") to the
+        # autocomplete handlers; bindKeys() is re-called later (AMES stop ->
+        # enableMenus) and used to REBIND these here without add="+", which
+        # silently replaced the AC handlers - Tab then only indented and Enter
+        # only made a newline even with the popup open. Never rebind them here.
         self.asstxt.bind("<Shift-Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-ISO_Left_Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-Tab>", lambda e: self.tabBlock(shift=-1))
@@ -1367,7 +1405,7 @@ class CocoIDE(tk.Frame):
         self.bind_all("<Command-Shift-O>", lambda e: self.open_project_dialog())
         self.bind_all("<Command-Alt-n>", lambda e: self.new_file_in_project())
         self.bind_all("<Command-Alt-N>", lambda e: self.new_file_in_project())
-        self.asstxt.bind("<Escape>", self.clearEditorHighlights)
+        self.asstxt.bind("<Escape>", self.clearEditorHighlights, add="+")
 
         # OSX/Mac OS users add cmd key options as well
         if platform == "darwin":
@@ -2134,7 +2172,10 @@ class CocoIDE(tk.Frame):
             if sf and os.path.isdir(sf):
                 self.startupFolder = sf
             if not self.projectPath:
-                self.projectPath = cfg.get("project")
+                rp = cfg.get("rootProject") or cfg.get("project")
+                if rp and os.path.isdir(rp):
+                    self.projectPath = rp
+                    self.rootProjectPath = rp
             if "autocomplete" in cfg:
                 self.acEnabled = bool(cfg["autocomplete"])
         except Exception:
@@ -2154,6 +2195,7 @@ class CocoIDE(tk.Frame):
             cfg = {"recentProjects": self.recentProjects[:10],
                    "recentFiles": self.openedFiles[:15],
                    "project": self.projectPath or "",
+                   "rootProject": self.rootProjectPath or "",
                    "startupFolder": self.startupFolder or "",
                    "autocomplete": bool(getattr(self, "acEnabled", True)),
                    "windowGeom": geom}
@@ -2214,12 +2256,15 @@ class CocoIDE(tk.Frame):
         return "break"
 
     def set_project(self, folder, startup=False):
-        """Set the working project directory and populate the file browser."""
+        """Open a folder as the project root (VS Code style: one root window,
+        sub-folders are expanded *inside* the tree, never replacing it)."""
         folder = os.path.abspath(folder)
         if not os.path.isdir(folder):
             messagebox.showerror("Project", "Folder not found:\n" + folder)
             return
         self.projectPath = folder
+        self.rootProjectPath = folder
+        self.expandedDirs = {folder}   # auto-expand the root itself
         self.startupFolder = folder
         if folder not in self.recentProjects:
             self.recentProjects.insert(0, folder)
@@ -2239,6 +2284,8 @@ class CocoIDE(tk.Frame):
 
     def close_project(self, event=None):
         self.projectPath = None
+        self.rootProjectPath = None
+        self.expandedDirs = set()
         self._populateProjectTree()
         self.saveConfig()
         return "break"
@@ -2332,21 +2379,37 @@ class CocoIDE(tk.Frame):
         self.projWin = self.projCanvas.create_window(0, 0, window=self.projFrame, anchor=tk.NW)
 
         def _conf_inner(event=None):
-            self.projCanvas.configure(scrollregion=(0, 0, self.projFrame.winfo_reqwidth(),
-                                                    self.projFrame.winfo_reqheight()))
+            # Debounce: rebuilding the tree fires a storm of <Configure> events;
+            # recomputing the scrollregion on every one made the whole window
+            # "jitter" and froze event processing. Coalesce them into one update.
+            if getattr(self, "_projConfAfter", None):
+                try:
+                    self.projCanvas.after_cancel(self._projConfAfter)
+                except Exception:
+                    pass
+            self._projConfAfter = self.projCanvas.after(
+                50, lambda: self._updateProjScrollregion())
         self.projFrame.bind('<Configure>', _conf_inner)
 
         def _conf_canvas(event=None):
-            self.projCanvas.itemconfigure(self.projWin, width=max(event.width,
-                                                        self.projFrame.winfo_reqwidth()))
+            # Only widen to fit content; never shrink below the canvas width,
+            # otherwise reqwidth↔itemconfigure feedback loops resize the layout.
+            try:
+                self.projCanvas.itemconfigure(self.projWin,
+                                              width=max(event.width, 160))
+            except Exception:
+                pass
         self.projCanvas.bind('<Configure>', _conf_canvas)
         self._bindMouseWheel(self.projCanvas)
 
         # Insert into the layout as column 0 (editor shifts to column 1 etc.)
         panel.grid(row=0, column=0, sticky="nsew", rowspan=3)
         self.mainPanel.grid_columnconfigure(0, minsize=190)
+        # NOTE: do NOT add weight to the sidebar column. The editor column keeps
+        # weight=1, so resizing the window never "jitters" the whole layout.
         self.projPanel = panel
         self.projVisible = True
+        self._projBusy = False        # guards against re-entrant rebuild loops
         self.projTreeItems = {}   # dirpath -> (row_index, label_widget)
         self._populateProjectTree()
         self.projmenu.entryconfig("Close Project",
@@ -2355,84 +2418,227 @@ class CocoIDE(tk.Frame):
     def toggleProjectBrowser(self, event=None):
         if getattr(self, "projVisible", True):
             self.projCanvas.itemconfigure(self.projWin, state="hidden")
-            self.projFrame.grid_remove()
             self.mainPanel.grid_columnconfigure(0, minsize=28)
             self.projToggle.config(text="▸")
             self.projTitle.config(text="")
             self.projVisible = False
         else:
             self.projCanvas.itemconfigure(self.projWin, state="normal")
-            self.projFrame.grid()
             self.mainPanel.grid_columnconfigure(0, minsize=190)
             self.projToggle.config(text="▾")
-            self.projTitle.config(text="PROJECT")
+            root = self.rootProjectPath or self.projectPath
+            self.projTitle.config(text=(os.path.basename(root).upper()[:16]
+                                        if root else "PROJECT"))
             self.projVisible = True
-        self._populateProjectTree()
         return "break"
 
+    def _projHover(self, widget, on):
+        """Highlight one tree row; remember it so a rebuild can clean up."""
+        try:
+            prev = getattr(self, "_projHoverW", None)
+            if prev is not None and prev is not widget and prev.winfo_exists():
+                prev.config(bg="#fafafa")
+            if on:
+                widget.config(bg="#e2ecf7")
+                self._projHoverW = widget
+            else:
+                if widget.winfo_exists():
+                    widget.config(bg="#fafafa")
+                if prev is widget:
+                    self._projHoverW = None
+        except Exception:
+            pass
+
+    def _updateProjScrollregion(self):
+        """Recompute the sidebar scroll region once (after debounced <Configure>)."""
+        try:
+            self._projConfAfter = None
+            if not self.projFrame.winfo_exists():
+                return
+            self.projCanvas.configure(
+                scrollregion=(0, 0, self.projCanvas.winfo_width(),
+                              max(self.projFrame.winfo_reqheight(),
+                                  self.projCanvas.winfo_height())))
+        except Exception:
+            pass
+
+    def _toggleDirExpanded(self, path):
+        """Expand/collapse a folder in place (VS Code style - the project root
+        never changes; sub-folders just open inside the tree)."""
+        if path in self.expandedDirs:
+            self.expandedDirs.discard(path)
+        else:
+            self.expandedDirs.add(path)
+            # keep the tree responsive on huge folders: cap how many are open
+            if len(self.expandedDirs) > 40:
+                self.expandedDirs = {self.rootProjectPath} | \
+                    set(list(self.expandedDirs)[-39:])
+        self._populateProjectTree()
+
+    def _showDirMenu(self, event, path):
+        """Right-click (macOS Ctrl-click included) menu for a folder row."""
+        m = tk.Menu(self, tearoff=0)
+        expanded = path in self.expandedDirs
+        m.add_command(label=("Collapse" if expanded else "Expand"),
+                      command=lambda p=path: self._toggleDirExpanded(p))
+        m.add_command(label="Open in Finder",
+                      command=lambda p=path: subprocess.Popen(["open", p])
+                      if platform == "darwin" else self.reveal_project_folder())
+        m.add_command(label="New File Here...",
+                      command=lambda p=path: self.new_file_in_dir(p))
+        m.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def new_file_in_dir(self, dirpath):
+        """Create a new .asm file inside dirpath and open it in the editor."""
+        filepath = filedialog.asksaveasfilename(title="New File in Folder",
+                                                initialdir=dirpath,
+                                                defaultextension=cf.fileext,
+                                                initialfile="newProg" + cf.fileext,
+                                                filetypes=(('CDM8 Assembly', '*'+cf.fileext),
+                                                           ('All files', '*.*')))
+        if not filepath:
+            return
+        try:
+            if not os.path.exists(filepath):
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write("; " + os.path.basename(filepath) + "\n")
+        except Exception as e:
+            messagebox.showerror("New File", "Could not create file:\n%s" % e)
+            return
+        self.file_new()
+        self.file_open(filepath=filepath)
+        # make sure the containing folder is visible in the tree
+        d = os.path.dirname(filepath)
+        while d and d.startswith(str(self.rootProjectPath or "")):
+            self.expandedDirs.add(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        self._populateProjectTree()
+
     def _populateProjectTree(self, event=None):
-        """Fill the sidebar with the project tree: folders then .asm/PDF/doc files."""
+        """Fill the sidebar with the *full* project tree under the opened root
+        folder. Folders expand/collapse in place (like VS Code Explorer); the
+        root itself never changes when you browse into a sub-folder."""
         if not hasattr(self, "projFrame"):
             return
+        if getattr(self, "_projBusy", False):
+            return                      # re-entrancy guard (no rebuild loops)
+        self._projBusy = True
+        try:
+            self._rebuildProjectTree()
+        finally:
+            self._projBusy = False
+
+    def _rebuildProjectTree(self):
+        # remember scroll position so expanding a node does not jump the view
+        try:
+            first = self.projCanvas.yview()[0]
+        except Exception:
+            first = 0.0
         for child in self.projFrame.winfo_children():
             child.destroy()
+        self._projHoverW = None         # old highlighted rows no longer exist
         self.projTreeItems = {}
         bold = (self.editorFontName, self.textsize, "bold")
         norm = (self.editorFontName, self.textsize)
-        row = 0
+        row = [0]
 
-        def addLabel(text, fg="#000000", fontspec=norm, indent=0, command=None, bg="#fafafa"):
-            nonlocal row
+        def addLabel(text, fg="#000000", fontspec=norm, indent=0, command=None,
+                     bg="#fafafa", rclick=None, tip=None):
             l = tk.Label(self.projFrame, text=text, anchor="w", justify=tk.LEFT,
-                         fg=fg, font=fontspec, bg=bg, padx=4 + indent*12, cursor="hand2")
-            l.grid(row=row, column=0, sticky="ew")
+                         fg=fg, font=fontspec, bg=bg, padx=4 + indent*12,
+                         cursor="hand2")
+            l.grid(row=row[0], column=0, sticky="ew")
             if command:
                 l.bind("<Button-1>", command)
-                l.bind("<Enter>", lambda e, w=l: w.config(fg="#1a5fb4", underline=True))
-                l.bind("<Leave>", lambda e, w=l, c=fg: w.config(fg=c, underline=False))
-            row += 1
+                # hover highlight only when the pointer actually moves over the
+                # row (plain <Enter> fires on every tree rebuild and produced an
+                # event storm that froze the UI). Also show a tooltip with the
+                # full path / action hint (long task names get truncated).
+                def _bindHover(w, tipfn):
+                    w.bind("<Motion>", lambda e, ww=w: self._projHover(ww, True))
+                    w.bind("<Leave>", lambda e, ww=w: (self._projHover(ww, False),
+                                                       self._hideTip()))
+                    w.bind("<Enter>", lambda e, ww=w, tf=tipfn: self._showTip(ww, tf))
+                _bindHover(l, tip)
+            if rclick:
+                l.bind("<Button-2>", rclick)          # macOS 2-finger click
+                l.bind("<Button-3>", rclick)
+                l.bind("<Control-Button-1>", rclick)  # Ctrl+click on Mac
+            row[0] += 1
             return l
 
-        if not self.projectPath:
+        root = self.rootProjectPath or self.projectPath
+        if not root:
             addLabel("No folder open", fg="#888888")
             addLabel('Click "\u2026" to open', fg="#888888")
             addLabel("a task folder", fg="#888888")
         else:
-            self.projTitle.config(text=os.path.basename(self.projectPath).upper()[:16] or "PROJECT")
-            addLabel(os.path.basename(self.projectPath) or self.projectPath,
-                     fontspec=bold, fg="#333333")
-            asmFiles, otherFiles, dirs = [], [], []
-            try:
-                entries = sorted(os.listdir(self.projectPath),
-                                 key=lambda s: s.lower())
-            except Exception:
-                entries = []
-            for name in entries:
-                if name.startswith("."):
-                    continue
-                full = os.path.join(self.projectPath, name)
-                if os.path.isdir(full):
-                    dirs.append(name)
-                elif name.lower().endswith(cf.fileext):
-                    asmFiles.append(name)
-                else:
-                    otherFiles.append(name)
-            for name in asmFiles:
-                full = os.path.join(self.projectPath, name)
-                mark = "● " if full == self.file_path else "   "
-                lbl = addLabel(mark+name, fg="#0b6e0b",
-                               command=lambda e, p=full: self.file_open(filepath=p))
-                if full == self.file_path:
-                    lbl.config(font=bold)
-            for name in otherFiles:
-                full = os.path.join(self.projectPath, name)
-                addLabel("   " + name, fg="#5555aa",
-                         command=lambda e, p=full: self.openExternalFile(p))
-            for name in dirs:
-                full = os.path.join(self.projectPath, name)
-                addLabel("  📁 " + name + "/", fontspec=bold, fg="#333333",
-                         command=lambda e, p=full: self.set_project(p))
+            title = os.path.basename(root) or root
+            self.projTitle.config(text=title.upper()[:16])
+            addLabel(title, fontspec=bold, fg="#333333",
+                     command=lambda e: self.open_project_dialog(),
+                     rclick=lambda e: self._showDirMenu(e, root),
+                     tip=lambda: root + "\nClick: open another folder\n" \
+                                       "Right-click: menu")
+            self._addTreeLevel(root, 0, bold, norm, addLabel)
         self.projFrame.update_idletasks()
+        try:
+            self.projCanvas.yview_moveto(first)
+        except Exception:
+            pass
+
+    def _addTreeLevel(self, dirpath, depth, bold, norm, addLabel):
+        """Recursively render one directory level of the project tree."""
+        if depth > 12:
+            return
+        asmFiles, otherFiles, dirs = [], [], []
+        try:
+            entries = sorted(os.listdir(dirpath), key=lambda s: s.lower())
+        except Exception:
+            addLabel(("  "*depth) + "\u26A0 no access", fg="#aa5500", indent=depth)
+            return
+        for name in entries:
+            if name.startswith("."):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                isdir = os.path.isdir(full)
+            except OSError:
+                continue
+            if isdir:
+                dirs.append((name, full))
+            elif name.lower().endswith(cf.fileext):
+                asmFiles.append((name, full))
+            else:
+                otherFiles.append((name, full))
+        # VS Code ordering: folders first, then files
+        for name, full in dirs:
+            expanded = full in self.expandedDirs
+            arrow = "\u25BE" if expanded else "\u25B8"   # ▾ / ▸
+            lbl = addLabel("%s %s/" % (arrow, name), fontspec=bold, fg="#333333",
+                           indent=depth,
+                           command=lambda e, p=full: self._toggleDirExpanded(p),
+                           rclick=lambda e, p=full: self._showDirMenu(e, p),
+                           tip=lambda f=full, x=expanded: f + (
+                               "\nClick to collapse" if x else "\nClick to expand"))
+            self.projTreeItems[full] = (lbl, expanded)
+            if expanded:
+                self._addTreeLevel(full, depth+1, bold, norm, addLabel)
+        for name, full in asmFiles:
+            mark = "\u25CF " if full == self.file_path else "   "
+            lbl = addLabel(mark+name, fg="#0b6e0b", indent=depth,
+                           command=lambda e, p=full: self.file_open(filepath=p),
+                           tip=lambda f=full: f + "\nClick: open in editor")
+            if full == self.file_path:
+                lbl.config(font=bold)
+        for name, full in otherFiles:
+            addLabel("   " + name, fg="#5555aa", indent=depth,
+                     command=lambda e, p=full: self.openExternalFile(p),
+                     tip=lambda f=full: f + "\nClick: open with system viewer")
 
     def openExternalFile(self, filepath):
         """Open non-asm project files (PDF briefs, READMEs...) with the system viewer."""
@@ -2766,15 +2972,25 @@ class CocoIDE(tk.Frame):
             self.acHide()
             return
         cands = self._acCandidates(prefix)
-        # Hide if nothing to offer or the exact word is already typed
-        cands = [c for c in cands if c != prefix.lower()]
+        # Hide if nothing to offer. A word that is EXACTLY typed (e.g. the
+        # register "r0") still shows its longer variants (r0h, r0l) - VS Code
+        # keeps suggesting refinements of a complete word too.
         if not cands:
             self.acHide()
             return
+        # keep the popup open while the user arrows through it: don't steal
+        # focus back to the text widget on every refresh (that retriggered
+        # KeyRelease chains and made the whole app feel frozen/jumpy)
+        hadFocus = self.asstxt.focus_get() is self.asstxt
         self.acWordStart = start
         self.acPrefix = prefix
         self.acWords = cands
         self._acShowPopup()
+        if hadFocus:
+            try:
+                self.asstxt.focus_force()
+            except Exception:
+                pass
 
     def _acShowPopup(self):
         if self.acListbox is None:
@@ -2835,6 +3051,19 @@ class CocoIDE(tk.Frame):
         lb.see(cur)
         return "break"
 
+    def _acRealEnd(self):
+        """True caret position: <Key>/<KeyRelease> events fire *before* the
+        widget applies the insertion, so 'insert' still points one char back."""
+        idx = self.asstxt.index(tk.INSERT)
+        try:
+            nxt = "%s+1c" % idx
+            if self.asstxt.compare(nxt, "<=", tk.END) \
+               and self.asstxt.get(idx, nxt) == self._acLastChar:
+                idx = nxt
+        except Exception:
+            pass
+        return idx
+
     def acAccept(self, event=None):
         """Insert the highlighted candidate (Tab / Enter)."""
         if not self.acIsVisible():
@@ -2846,16 +3075,22 @@ class CocoIDE(tk.Frame):
             return "break"
         word = self.acWords[sel[0]]
         start = self.acWordStart
-        end = self.asstxt.index(tk.INSERT)
+        end = self._acRealEnd()
+        lineTxt = self.asstxt.get(start, "%s lineend" % end)
+        tail = lineTxt[len(word):] if lineTxt.startswith(word) else ""
+        # smart suffix: completing an instruction with no operands yet gets
+        # ", " appended (VS Code style); never duplicates an existing comma
+        suffix = ""
+        if not tail.lstrip().startswith(",") \
+           and self.acDict.get(word, "") in ("instruction", "directive"):
+            suffix = ", "
         self.acIgnored = True
         try:
             self.asstxt.edit_separator()
-            self.asstxt.mark_set("insertBeforeAC", end)
             self.asstxt.delete(start, end)
-            self.asstxt.insert(start, word)
-            # add separators automatically for ld/st/push-style ops? keep simple:
-            # append ", " only when user explicitly accepts at word boundary? no.
-            self.asstxt.mark_gravity("insertBeforeAC", tk.LEFT)
+            self.asstxt.insert(start, word + suffix)
+            if suffix:
+                self.asstxt.mark_set(tk.INSERT, start + "+%dc" % len(word))
         finally:
             self.acIgnored = False
         self.acHide()
@@ -2895,12 +3130,10 @@ class CocoIDE(tk.Frame):
 
     def _acTabHandler(self, event=None):
         """<Tab> binding: accept a completion candidate when the popup is
-        open; otherwise fall back to normal Tab behaviour (insert tab)."""
+        open; otherwise fall back to normal Tab behaviour (block indent)."""
         if self.acIsVisible():
             return self.acAccept()
-        # plain tab insertion, keeping undo-separators tidy
-        self.asstxt.insert(tk.INSERT, "\t")
-        return "break"
+        return self.tabBlock(shift=1)
 
     def toggleAutocomplete(self, event=None, refreshOnly=False):
         if not refreshOnly:
@@ -2918,6 +3151,13 @@ class CocoIDE(tk.Frame):
 
     def _acKeyFilter(self, event):
         """Bind on <Key>: intercept navigation/acceptance keys while popup shows."""
+        # remember the just-typed char so acAccept can compute the true caret
+        # position (<Key>/<KeyRelease> fire before the widget inserts it)
+        try:
+            self._acLastChar = event.char if (event.char and len(event.char) == 1) \
+                               else ""
+        except Exception:
+            self._acLastChar = ""
         if not self.acIsVisible():
             return None
         ks = event.keysym
