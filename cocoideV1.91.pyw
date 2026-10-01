@@ -797,11 +797,21 @@ class CocoIDE(tk.Frame):
         self.lntext.config(state="disabled")
         self.lntext.bind('<MouseWheel>', lambda e: "break")
         
-        # Text editor window
+        # Text editor window.
+        # NOTE: the old code passed padright=26 to reserve a right gutter for
+        # the error strip - but 'padright' is NOT a valid Tk Text option (it
+        # crashes with TclError on Python 3.14 / stock macOS Tk). The gutter
+        # is now created legally in _makeErrStrip(): a uniform highlight
+        # border painted in the text background colour + a right-gravity tab
+        # stop at col 200 so long comments never run under the red ticks.
         self.asstxt = tk.Text(mainPanel, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
-                                autoseparators=True, maxundo=-1, width=40,
-                                padright=26)#, height=10,) height=editorHeight,
+                                autoseparators=True, maxundo=-1, width=40)
+        try:
+            _tabpx = self.defaulttxtfont.measure("0" * 200) + 32
+            self.asstxt.config(tabs="%g %s right" % (_tabpx, "200c"))
+        except Exception:
+            pass
         self.asstxt.grid(row=0, column=1, sticky="nsew")
         # Scroll bars
         self.vscroll = ttk.Scrollbar(mainPanel, orient=tk.VERTICAL, command=self.yview)
@@ -811,11 +821,10 @@ class CocoIDE(tk.Frame):
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
         # VS Code style error strip (red ticks on the scrollbar gutter).
-        # Created after asstxt exists; placed in the padright gutter so it
-        # never covers text (the Text widget reserves 26 px of empty margin
-        # at its right edge - see padright above). The strip itself is
-        # transparent: only the red tick marks are drawn, over the gutter's
-        # background colour.
+        # Created after asstxt exists. It is a narrow canvas placed inside the
+        # editor's own border margin (highlightthickness below), *after* the
+        # right-gravity tab stop at col 200, so long comments can never be
+        # painted over by the strip - see the tabs config above.
         try:
             self._makeErrStrip()
         except Exception:
@@ -841,9 +850,18 @@ class CocoIDE(tk.Frame):
         self.asstxt.edit_separator()
         #print("**\n",self.asstxt.bindtags())#debug
         
-        # Editor formatting options
+        # Editor formatting options. NOTE: the old code passed a bare
+        # 'tabs=tab_width' here, which silently WIPED the right-gravity tab
+        # stop configured at widget creation (the gutter for the error
+        # strip). We re-declare both stops in one string now: regular indent
+        # tabs first, then the invisible col-200 right stop.
         tab_width = self.defaulttxtfont.measure('OOOO')  # compute desired width of tabs
-        self.asstxt.config(font=self.boldfont, tabs=tab_width, tabstyle="wordprocessor")#"1.0c 2.0c 3.0c")#tab_width,))
+        try:
+            _gutter_px = self.defaulttxtfont.measure("0" * 200) + 32
+            _tabspec = "%d %g %s right" % (tab_width, _gutter_px, "200c")
+        except Exception:
+            _tabspec = "%d" % tab_width
+        self.asstxt.config(font=self.boldfont, tabs=_tabspec, tabstyle="wordprocessor")#"1.0c 2.0c 3.0c")#tab_width,))
 
         ## Create the machine code memory list display panel
         # The right-hand bottom area is a TAB STRIP (VS Code style): the fixed
@@ -4944,12 +4962,25 @@ class CocoIDE(tk.Frame):
 
     def _makeErrStrip(self):
         """Create the strip canvas; call once after asstxt/scrollbar exist."""
-        self.errStrip = tk.Canvas(None, width=14,
-                                  background=self.asstxt.cget("background"),
+        # Reserve a right gutter for the red error ticks. The old code used
+        # padright=26, which is NOT a legal Tk Text option and crashed
+        # startup (TclError) on Python 3.14 / stock macOS Tk. Legal combo:
+        # a uniform highlight border painted in the text background colour
+        # acts as empty padding around the widget (the vertical scrollbar is
+        # a separate widget, so nothing overlaps), plus the right-gravity tab
+        # stop at col 200 configured in __init__ keeps long lines clear of
+        # the tick area.
+        bg = self.asstxt.cget("background")
+        try:
+            self.asstxt.config(highlightbackground=bg, highlightcolor=bg,
+                               highlightthickness=6)
+        except Exception:
+            pass
+        self.errStrip = tk.Canvas(None, width=14, background=bg,
                                   highlightthickness=0, borderwidth=0)
-        # sits in the padright=26 gutter *after* the last text column, so a
-        # long comment can never be painted over by the strip itself; only
-        # the small red ticks are drawn on top of the gutter colour
+        # sits in the gutter *after* the last text column, so a long comment
+        # can never be painted over by the strip itself; only the small red
+        # ticks are drawn on top of the gutter colour
         self.errStrip.place(in_=self.asstxt, relx=1.0, x=-22, rely=0.0,
                             relheight=1.0)
         self.errStrip.bind("<Button-1>", self._errStripClick)
