@@ -10,13 +10,16 @@ Usage (run from the project folder, no arguments needed):
 
 What it produces:
 
-  * macOS   -> dist/CocoIDE.app      (drag to /Applications or Desktop)
+  * macOS   -> dist/CocoIDE.app      (drag to /Applications or Desktop;
+                                      double-click launches the IDE directly -
+                                      NO terminal window, no "close processes?"
+                                      prompt, Dock icon + native menu bar)
   * Windows -> dist\\CocoIDE\\CocoIDE.exe  (folder with exe + libs)
   * Linux   -> dist/CocoIDE/CocoIDE  (same folder layout; can be desktop-linked)
 
-Requirements: Python 3 with Tkinter (tkinter is part of the standard python.org
-macOS installer; on Debian/Ubuntu: sudo apt install python3-tk). PyInstaller is
-installed automatically into a throwaway virtualenv by this script if missing.
+Requirements: Python 3 with Tkinter (Tk is part of the python.org macOS
+installer). PyInstaller is installed automatically into a throwaway virtualenv
+by this script if missing.
 
 The resulting bundle contains the interpreter, Tk/Tcl and all program modules
 (cocas.py, cdm8_emu.py, ...), plus data files standard.mlb / sendfile.py /
@@ -76,6 +79,17 @@ def build(pybin):
            "--workpath", "build",
            "--specpath", "build",
            ] + icon_flag()
+    if sys.platform == "darwin":
+        # pyobjc lets the frozen app set its real macOS identity at runtime
+        # (Dock name/icon, bring-to-front, native About/Hide/Quit menu).
+        try:
+            subprocess.check_call([pybin, "-c", "import AppKit"],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        except Exception:
+            run([pybin, "-m", "pip", "--quiet", "--disable-pip-version-check",
+                 "install", "pyobjc-framework-Cocoa"])
+        cmd += ["--hidden-import", "AppKit"]
     for d in DATA_FILES:
         src = os.path.join(HERE, d)
         if os.path.exists(src):
@@ -94,20 +108,24 @@ def mac_postprocess():
         return
     with open(plist, "r", encoding="utf-8") as f:
         txt = f.read()
-    repl = {
-        "<key>CFBundleDisplayName</key>": None,  # ensure present below
-    }
-    add = textwrap.dedent("""\
-        <key>CFBundleDisplayName</key><string>CocoIDE</string>
-        <key>NSHighResolutionCapable</key><true/>
-        <key>CFBundleShortVersionString</key><string>1.91</string>
-        <key>CFBundleDevelopmentRegion</key><string>en</string>
-        """)
+    add = ""
+    if "CFBundleDisplayName" not in txt:
+        add += "<key>CFBundleDisplayName</key><string>CocoIDE</string>\n\t"
     if "NSHighResolutionCapable" not in txt:
+        add += "<key>NSHighResolutionCapable</key><true/>\n\t"
+    if "CFBundleShortVersionString" not in txt:
+        add += "<key>CFBundleShortVersionString</key><string>1.91</string>\n\t"
+    if "CFBundleDevelopmentRegion" not in txt:
+        add += ("<key>CFBundleDevelopmentRegion</key><string>en"
+                "</string>\n\t")
+    # GUI app must never pretend to be a background/agent app:
+    if "LSUIElement" not in txt:
+        add += "<key>LSUIElement</key><false/>\n\t"
+    if add:
         txt = txt.replace("</dict>", add + "</dict>", 1)
-    with open(plist, "w", encoding="utf-8") as f:
-        f.write(txt)
-    print("Patched Info.plist (Retina support, display name).")
+        with open(plist, "w", encoding="utf-8") as f:
+            f.write(txt)
+        print("Patched Info.plist (display name, Retina, version).")
 
 
 def main():
@@ -138,8 +156,10 @@ def main():
     print()
     if sys.platform == "darwin":
         print("DONE. Double-clickable app:  dist/CocoIDE.app")
-        print("Tip: drag it to /Applications. First launch via network copy "
-              "may need right-click -> Open (Gatekeeper).")
+        print("Drag it to /Applications and launch from Launchpad/Finder -")
+        print("it opens straight into the IDE, no Terminal involved.")
+        print("(First launch after download may need right-click -> Open once;")
+        print(" your own local builds are not quarantined and just open.)")
     elif os.name == "nt":
         print("DONE. Run:  dist\\%s\\%s.exe" % (APP_NAME, APP_NAME))
     else:

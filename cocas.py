@@ -1465,7 +1465,24 @@ def compile_asm (codetext=None, cdm8ver=4 ):
             text += [line.expandtabs()]
 
     mlb_name = 'standard.mlb'
-    mlb_path = os.path.join(sys.path[0], mlb_name)
+    # Search order: CWD (legacy), then the folder of this module, then the
+    # executable/bundle dir (frozen apps put data next to the binary or in
+    # Contents/Resources), then sys.path[0].  This makes macro libraries work
+    # when CocoIDE is packaged as a double-clickable .app/.exe.
+    _cand_dirs = [os.getcwd(),
+                  os.path.dirname(os.path.abspath(__file__)),
+                  (os.path.dirname(os.path.abspath(sys.executable))
+                   if getattr(sys, 'frozen', False) else ''),
+                  (getattr(sys, '_MEIPASS', '') or ''),
+                  (os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                'Resources')
+                   if getattr(sys, 'frozen', False) else ''),
+                  (sys.path[0] if sys.path else '')]
+    mlb_path = mlb_name
+    for _d in _cand_dirs:
+        if _d and os.path.exists(os.path.join(_d, mlb_name)):
+            mlb_path = os.path.join(_d, mlb_name)
+            break
 
     skipfile=False
     try:
@@ -1530,7 +1547,24 @@ if __name__ == "__main__":
 
 
     mlb_name = 'standard.mlb'
-    mlb_path = os.path.join(sys.path[0], mlb_name)
+    # Search order: CWD (legacy), then the folder of this module, then the
+    # executable/bundle dir (frozen apps put data next to the binary or in
+    # Contents/Resources), then sys.path[0].  This makes macro libraries work
+    # when CocoIDE is packaged as a double-clickable .app/.exe.
+    _cand_dirs = [os.getcwd(),
+                  os.path.dirname(os.path.abspath(__file__)),
+                  (os.path.dirname(os.path.abspath(sys.executable))
+                   if getattr(sys, 'frozen', False) else ''),
+                  (getattr(sys, '_MEIPASS', '') or ''),
+                  (os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                'Resources')
+                   if getattr(sys, 'frozen', False) else ''),
+                  (sys.path[0] if sys.path else '')]
+    mlb_path = mlb_name
+    for _d in _cand_dirs:
+        if _d and os.path.exists(os.path.join(_d, mlb_name)):
+            mlb_path = os.path.join(_d, mlb_name)
+            break
 
     skipfile=False
     try:

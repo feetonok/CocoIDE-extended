@@ -180,6 +180,100 @@ def resPath(name):
     return os.path.join(appDir(), name)
 
 USERDIR = appDir() if _isFrozen() else os.path.expanduser("~")
+
+def _macActivate():
+    """Bring CocoIDE to the front on macOS and give it a proper application
+    identity (menu-bar name, Dock icon, 'Quit CocoIDE'). Works both when run
+    from source (via Cocoa-Python / python.org Tk frameworks) and inside a
+    PyInstaller .app bundle."""
+    try:
+        from AppKit import (NSApplication, NSApp, NSApplicationActivationPolicyRegular,
+                           NSThread)
+        if not NSThread.isMainThread():
+            return False
+        if NSApp is None:
+            NSApplication.sharedApplication()
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        NSApp.activateIgnoringOtherApps_(True)
+        info = NSApplication.sharedApplication().infoDictionary()
+        if info is not None:
+            try:
+                info["CFBundleName"] = "CocoIDE"
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _macAboutHandler(_sender=None):
+    """Route the native 'About CocoIDE' menu item to our own dialog."""
+    try:
+        for w in tk.Toplevel.winfo_toplevel(tk)._default_root.winfo_children():
+            pass
+    except Exception:
+        pass
+    root = getattr(tk, "_cocoide_root", None)
+    if root is not None and hasattr(root, "aboutDialog"):
+        try:
+            root.aboutDialog()
+        except Exception:
+            pass
+
+
+def _macInstallAppMenu():
+    """Build a real macOS application menu (About/Hide/Quit) so the app feels
+    native instead of relying on Tk's minimal default menu."""
+    try:
+        from AppKit import (NSApplication, NSApp, NSMenu, NSMenuItem,
+                            NSThread)
+        if not NSThread.isMainThread():
+            return False
+        app = NSApplication.sharedApplication()
+        main_menu = NSMenu.alloc().init()
+        # Application submenu
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("CocoIDE", None, "")
+        submenu = NSMenu.alloc().initWithTitle_("CocoIDE")
+        ai = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "About CocoIDE", _macAboutHandler, "")
+        submenu.addItem_(ai)
+        sep1 = NSMenuItem.separatorItem()
+        submenu.addItem_(sep1)
+        hi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Hide CocoIDE", "hide:", "h")
+        submenu.addItem_(hi)
+        ho = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Hide Others", "hideOtherApplications:", "h")
+        ho.setKeyEquivalentModifierMask_(0x100000 | 0x80000)  # Cmd+Opt
+        submenu.addItem_(ho)
+        su = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Show All", "unhideAllApplications:", "")
+        submenu.addItem_(su)
+        submenu.addItem_(NSMenuItem.separatorItem())
+        qi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Quit CocoIDE", "terminate:", "q")
+        submenu.addItem_(qi)
+        item.setSubmenu_(submenu)
+        main_menu.addItem_(item)
+        # Window submenu (needed for Minimize/Zoom that Tk expects)
+        witem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Window", None, "")
+        wsub = NSMenu.alloc().initWithTitle_("Window")
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Minimize", "performMiniaturize:", "m")
+        wsub.addItem_(mi)
+        zi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Zoom", "performZoom:", "")
+        wsub.addItem_(zi)
+        witem.setSubmenu_(wsub)
+        main_menu.addItem_(witem)
+        app.setMainMenu_(main_menu)
+        try:
+            app.setWindowsMenu_(wsub)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
     #raise # debug
 
 class CreateToolTip(object):
@@ -221,21 +315,34 @@ class CreateToolTip(object):
             self.widget.after_cancel(id)
 
     def showtip(self, event=None):
-        x = y = 0
-        x, y, cx, cy = self.widget.bbox("insert")
-        x += self.widget.winfo_rootx() - 70
-        y += self.widget.winfo_rooty() - 40
+        # NOTE: this class is instantiated with no-arg after() callbacks, so
+        # `event` is always None here -> position from the widget geometry.
+        # (The old code used bbox("insert"), which raises TclError on Label
+        # widgets like the memory cells - that was the source of empty/broken
+        # hover boxes.)
+        try:
+            self.widget.winfo_toplevel().update_idletasks()
+        except Exception:
+            pass
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         # creates a toplevel window
         self.tw = tk.Toplevel(self.widget)
         # Leaves only the label and removes the app window
         self.tw.wm_overrideredirect(True)
         self.tw.wm_geometry("+%d+%d" % (x, y))
         label = tk.Label(self.tw,  justify='left',
-                       background="#ffffff", relief='solid', borderwidth=1,
+                       background="#3a3a3c", foreground="#ffffff",
+                       relief='flat', borderwidth=0, padx=10, pady=7,
+                       font=("TkDefaultFont", 10),
                        wraplength = self.wraplength)
-        # Get memory cell content
-        memValHex = self.widget["text"]
-        memValDec = int(memValHex, 16)
+        # Get memory cell content (guard: widget text must be a hex byte)
+        try:
+            memValHex = self.widget["text"]
+            memValDec = int(memValHex, 16)
+        except Exception:
+            self.hidetip()
+            return
         if memValDec >= 32 and memValDec < 127:
             memValStr = "'"+chr(memValDec)+"'"
         elif memValDec == 0:
@@ -427,6 +534,11 @@ class CocoIDE(tk.Frame):
         self.smallfont.config(size=self.textsize-2)
         self.smallboldfont = font.Font(font="TkFixedFont")#self.asstxt['font'])
         self.smallboldfont.config(size=self.textsize-2, weight="bold")
+        # proportional UI font for hover tooltips (macOS help-book bubbles)
+        try:
+            self.tipfont = font.Font(family="TkDefaultFont", size=self.textsize-1)
+        except Exception:
+            self.tipfont = ("TkDefaultFont", self.textsize-1)
         
         # Ames stuff
         self.amesRunning = False#True
@@ -461,6 +573,11 @@ class CocoIDE(tk.Frame):
         self.recentMenu = tk.Menu(self.filemenu, tearoff=0)
         self.filemenu.add_cascade(label="Open Recent", menu=self.recentMenu)
         self._rebuildRecentMenu()
+        self.filemenu.add_separator()
+        self.filemenu.add_command(label="Quick Open File\u2026", command=self.showQuickOpen,
+                                  accelerator=comkey+"p")
+        self.filemenu.add_command(label="Command Palette\u2026", command=self.showCmdPalette,
+                                  accelerator=(comkey+"⇧P") if platform == "darwin" else "Ctrl+Shift+P")
         self.filemenu.add_separator()
         self.filemenu.add_command(label="Close File", command=self.file_close)
         self.filemenu.add_command(label="Quit", command=self.close_window, accelerator=comkey+"q")#self.quit)
@@ -643,7 +760,9 @@ class CocoIDE(tk.Frame):
         
         ## Status bar (below the main panel): cursor position, file type, project
         self.statusbar = tk.Frame(self, name="statusbar", bg="#e8e8e8", height=22)
-        self.statusbar.grid(row=2, column=0, sticky="ew")
+        # NOTE: row 3, not row 2 - mainPanel occupies row 1; sharing a grid row
+        # made the bar overlap/clip the bottom of the panels above it.
+        self.statusbar.grid(row=3, column=0, sticky="ew")
         self.statusbar.grid_propagate(False)
         self.cursorLabel = tk.Label(self.statusbar, text="Ln 1, Col 1", anchor="w",
                                     bg="#e8e8e8", font=self.smallfont, padx=6)
@@ -688,6 +807,13 @@ class CocoIDE(tk.Frame):
         txtHscroll = ttk.Scrollbar(mainPanel, orient=tk.HORIZONTAL, command=self.asstxt.xview)
         txtHscroll.grid(row=1, column=0,columnspan=2, sticky="ew")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
+
+        # VS Code style error strip (red ticks on the scrollbar gutter).
+        # Created after asstxt exists; placed over the editor's right edge.
+        try:
+            self._makeErrStrip()
+        except Exception:
+            pass
         
         # Status-bar cursor position updates (asstxt exists only from here on)
         self.asstxt.bind("<<CaretMove>>", self._updateStatusCursor, add=True)
@@ -703,16 +829,51 @@ class CocoIDE(tk.Frame):
         self.asstxt.config(font=self.boldfont, tabs=tab_width, tabstyle="wordprocessor")#"1.0c 2.0c 3.0c")#tab_width,))
 
         ## Create the machine code memory list display panel
-        mcode_frame=ttk.Frame(mainPanel)#, width=60)
-        mcode_frame.grid(row=0, column=3, sticky="nsew")#pack(fill=tk.Y, expand=1, side=tk.LEFT)
+        # The right-hand bottom area is a TAB STRIP (VS Code style): the fixed
+        # "Machine Code" listing tab plus one closable tab per file opened from
+        # the project tree (asm/txt listings shown inline; PDFs and other types
+        # open in the system viewer but still get a tab). Handy for demoing a
+        # task brief next to the code.
+        mcodeTabs = ttk.Frame(mainPanel)
+        mcodeTabs.grid(row=0, column=3, sticky="nsew")
+        mcodeTabs.rowconfigure(1, weight=1)
+        mcodeTabs.columnconfigure(0, weight=1)
+        self.mcodeTabBar = tk.Frame(mcodeTabs, bg="#e6e6e6", height=24)
+        self.mcodeTabBar.grid(row=0, column=0, sticky="ew")
+        self.mcodeTabBar.grid_propagate(False)
+        self.mcodeTabStack = tk.Frame(mcodeTabs)   # switchable content frames
+        self.mcodeTabStack.grid(row=1, column=0, sticky="nsew")
+        self.mcodeTabStack.rowconfigure(0, weight=1)
+        self.mcodeTabStack.columnconfigure(0, weight=1)
+
+        mcode_frame = ttk.Frame(self.mcodeTabStack)
+        mcode_frame.grid(row=0, column=0, sticky="nsew")
+        self._mcodeFrame = mcode_frame
         self.mcode_list=tk.Text(mcode_frame, yscrollcommand=self.yscroll2, width=25,
                                 wrap=tk.NONE, font=self.defaulttxtfont)#, height=editorHeight)
-        mcodeHscroll = ttk.Scrollbar(mainPanel, orient=tk.HORIZONTAL, command=self.mcode_list.xview)
-        mcodeHscroll.grid(row=1, column=3, sticky="ew")
-        self.mcode_list.config(xscrollcommand=mcodeHscroll.set)                        
+        mcodeHscroll = ttk.Scrollbar(mcode_frame, orient=tk.HORIZONTAL, command=self.mcode_list.xview)
+        mcodeHscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.mcode_list.config(xscrollcommand=mcodeHscroll.set)
+
+        # Tab state: first entry is the fixed Machine Code tab
+        self.viewTabs = [("__mcode__", None)]     # (key, filepath-or-None)
+        self.activeViewTab = "__mcode__"
+        self.tabButtons = {}                      # key -> (label widget, frame)
+        self._fileTabFrames = {}                  # filepath -> frame
+        self._rebuildMcodeTabBar()                        
                                 
         self.mcode_list.bind("<Key>", lambda e: "break") # Disable editing
         self.mcode_list.pack(fill=tk.BOTH, expand=1)
+
+        # --- Editor tab bar (VS Code style multiple open files) ---
+        self.editorTabs = [{"path": None, "name": "Untitled", "dirty": False}]
+        self.activeTab = 0
+        self._tabSwapGuard = False
+        self._savedBuffers = {}      # path -> (content, insert-index) while inactive
+        self.editorTabBar = tk.Frame(mainPanel, bg="#e6e6e6", height=25)
+        self.editorTabBar.grid(row=2, column=0, columnspan=3, sticky="ew")
+        self.editorTabBar.grid_propagate(False)
+        self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
 
         ## Bind editor keys
         self.bindKeys()
@@ -745,8 +906,21 @@ class CocoIDE(tk.Frame):
         # Autocomplete key wiring: navigation/accept keys are handled by _acKeyFilter
         # (<Key> binding added further below); Tab is intercepted first so that it
         # accepts a suggestion when the popup is visible and indents otherwise.
-        self.asstxt.bind("<Tab>", self._acTabHandler, add="+")
-        self.asstxt.bind("<Return>", lambda e: self.acAccept(), add="+")
+        # NOTE: these are bound WITHOUT add="+" on purpose. Tk's built-in Text
+        # class bindings for <Tab>/<Return> (insert tab / newline) run AFTER
+        # widget bindings only if the handler returns None; our handlers return
+        # "break" when they accept a completion, which stops that chain. With
+        # add="+" an earlier binding existed, Tk's chained script could swallow
+        # the "break" and insert the character anyway - the popup appeared to
+        # do nothing on Tab/Enter.
+        self.asstxt.bind("<Tab>", self._acTabHandler)
+        # Return must be a real method binding, not a lambda that inserts
+        # "\n" as its *return value*: Tk treats a returned string as a Tcl
+        # script to EVAL (like "break"), so the old lambda inserted the letter
+        # 'n' instead of a newline. acAccept returns "break" when it consumed
+        # the key on a visible popup; returning None here lets Tk's built-in
+        # Text class binding insert the newline normally afterwards.
+        self.asstxt.bind("<Return>", self._returnHandler)
         # Explicit widget-level bindings for popup navigation. The <Key> filter
         # alone is not enough: Tk's built-in Text bindings for Up/Down/Escape
         # run first and move the caret / close dialogs before we can "break"
@@ -765,6 +939,11 @@ class CocoIDE(tk.Frame):
         else:
             self._safeBind(self, "<Control-space>", lambda e: self.acTrigger())
             self._safeBind(self, "<Control-Shift-space>", lambda e: self.acTrigger())
+        # Cmd+Shift+P / Ctrl+Shift+P: command palette (VS Code style)
+        if platform == "darwin":
+            self._safeBind(self, "<Command-Shift-p>", lambda e: self.showCmdPalette())
+        else:
+            self._safeBind(self, "<Control-Shift-p>", lambda e: self.showCmdPalette())
         self.asstxt.bind("<FocusOut>", lambda e: self.acHide())
 
 
@@ -806,7 +985,10 @@ class CocoIDE(tk.Frame):
 
         ## Create and add Watch panel
         watchPanel = tk.Frame(mainPanel, name="watchpanel")#, bg="blue")#,  height=80)#,  background="red") #width=570,
-        watchPanel.grid(row=2, column=0, columnspan=3, sticky="nsew")#pack(side=tk.LEFT, fill=tk.BOTH)
+        # start at column 1 so the PROJECT sidebar (column 0) never covers
+        # the Memory Watches list - previously this spanned from column 0 and
+        # the watches were hidden behind the file tree.
+        watchPanel.grid(row=2, column=1, columnspan=2, sticky="nsew")
         watchPanel.columnconfigure(0, weight=1)
         #watchPanel.columnconfigure(1, weight=1) 
         # And contents
@@ -852,7 +1034,7 @@ class CocoIDE(tk.Frame):
         self.pcLab.grid(row=1, column=0, sticky="w")#, columnspan=2)
         self.pcLabVal = tk.Label(self.regPanel, text="00",width=6, bg=cf.PCcolour, relief="sunken", padx=3, font=self.defaulttxtfont)
         self.pcLabVal.grid(row=2, column=0, sticky="w")
-        self.pcLabVal.bind("<Enter>", lambda e: self._showTip(self.pcLabVal, self.tipPC))
+        self.pcLabVal.bind("<Enter>", lambda e: self._showTip(self.pcLabVal, self.tipPC, e))
         self.pcLabVal.bind("<Leave>", self._hideTip)
 
         # PS register (CVZN etc.)
@@ -862,9 +1044,9 @@ class CocoIDE(tk.Frame):
         self.CVZN_Val = tk.Label(self.regPanel, text="0 000 0000", bg="white", width=15, relief="sunken", font=self.defaulttxtfont)
         self.CVZN_Val.grid(row=2, column=1, columnspan=2)#, sticky="e")#, columnspan=2)
         # macOS-style tooltips: live decode of the PS (status) register bits
-        self.CVZN_Lab.bind("<Enter>", lambda e: self._showTip(self.CVZN_Lab, self.tipPS))
+        self.CVZN_Lab.bind("<Enter>", lambda e: self._showTip(self.CVZN_Lab, self.tipPS, e))
         self.CVZN_Lab.bind("<Leave>", self._hideTip)
-        self.CVZN_Val.bind("<Enter>", lambda e: self._showTip(self.CVZN_Val, self.tipPS))
+        self.CVZN_Val.bind("<Enter>", lambda e: self._showTip(self.CVZN_Val, self.tipPS, e))
         self.CVZN_Val.bind("<Leave>", self._hideTip)
 
         # Stack Pointer
@@ -872,7 +1054,7 @@ class CocoIDE(tk.Frame):
         self.spLab.grid(row=1, column=3)#, columnspan=2)
         self.spVal = tk.Label(self.regPanel, text="00", bg=cf.SPcolour, width=7, relief="sunken", font=self.defaulttxtfont)
         self.spVal.grid(row=2, column=3)#, columnspan=2)
-        self.spVal.bind("<Enter>", lambda e: self._showTip(self.spVal, self.tipSP))
+        self.spVal.bind("<Enter>", lambda e: self._showTip(self.spVal, self.tipSP, e))
         self.spVal.bind("<Leave>", self._hideTip)
 
 
@@ -887,7 +1069,7 @@ class CocoIDE(tk.Frame):
         for index in range(4):
             self.regLabs[index] = tk.Label(self.regPanel, text="r"+str(index), width=8, padx=5, fg="blue", font=self.boldfont)
             self.regLabs[index].grid(row=4, column=index, sticky="n")
-            self.regLabs[index].bind("<Enter>", lambda e, i=index: self._showTip(self.regLabs[i], lambda: self.tipReg(i)))
+            self.regLabs[index].bind("<Enter>", lambda e, i=index: self._showTip(self.regLabs[i], lambda: self.tipReg(i), e))
             self.regLabs[index].bind("<Leave>", self._hideTip)
             self.regHexs[index] = tk.Label(self.regPanel, text="0x00", width=8, bg="white", relief="sunken",font=self.defaulttxtfont)
             self.regHexs[index].grid(row=5, column=index, sticky="n")
@@ -1054,9 +1236,18 @@ class CocoIDE(tk.Frame):
 
         # Build the project file browser sidebar (VS Code style Explorer)
         self._buildProjectBrowser()
+        # Restore expanded folders from last session (only those inside root)
+        savedExp = [p for p in getattr(self, "_savedExpandedDirs", [])
+                    if os.path.isdir(p)]
         # Reopen last session's project (if it still exists)
         if self.projectPath and os.path.isdir(self.projectPath):
             self.set_project(self.projectPath, startup=True)
+            for p in savedExp:
+                rp = self.rootProjectPath or ""
+                if rp and (p == rp or p.startswith(rp + os.sep)):
+                    self.expandedDirs.add(p)
+            if savedExp:
+                self._populateProjectTree()
         elif self.recentProjects:
             for p in self.recentProjects:
                 if os.path.isdir(p):
@@ -1379,11 +1570,11 @@ class CocoIDE(tk.Frame):
             self.asstxt.bind("<Control-v>", self.paste)
             self.asstxt.bind("<Control-V>", self.paste)
         
-        # NOTE: <Tab>/<Return> are bound once in __init__ (add="+") to the
-        # autocomplete handlers; bindKeys() is re-called later (AMES stop ->
-        # enableMenus) and used to REBIND these here without add="+", which
-        # silently replaced the AC handlers - Tab then only indented and Enter
-        # only made a newline even with the popup open. Never rebind them here.
+        # NOTE: <Tab>/<Return> are bound once in __init__ to the autocomplete
+        # handlers (returning "break" when a candidate is accepted, falling back
+        # to indent/newline otherwise); bindKeys() is re-called later (AMES stop
+        # -> enableMenus) and must NEVER rebind these - that silently replaced
+        # the AC handlers and broke Tab/Enter completion.
         self.asstxt.bind("<Shift-Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-ISO_Left_Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-Tab>", lambda e: self.tabBlock(shift=-1))
@@ -1406,6 +1597,8 @@ class CocoIDE(tk.Frame):
         self.bind_all("<Command-Alt-n>", lambda e: self.new_file_in_project())
         self.bind_all("<Command-Alt-N>", lambda e: self.new_file_in_project())
         self.asstxt.bind("<Escape>", self.clearEditorHighlights, add="+")
+        if platform != "darwin":
+            self._safeBind(self, "<Control-p>", lambda e: self.showQuickOpen())
 
         # OSX/Mac OS users add cmd key options as well
         if platform == "darwin":
@@ -1434,6 +1627,12 @@ class CocoIDE(tk.Frame):
             self.asstxt.bind("<Command-Left>", self.lineStart)
             self.asstxt.bind("<Command-Up>", lambda e: self.asstxt.yview_moveto(0))
             self.asstxt.bind("<Command-Down>", lambda e: self.asstxt.yview_moveto(1))
+            # Quick-open file picker (VS Code style). Lowercase 'p' keysym via
+            # _safeBind; Ctrl-Tab cycles editor tabs (unbound for editing above).
+            self._safeBind(self, "<Command-p>", lambda e: self.showQuickOpen())
+            self._safeBind(self, "<Command-P>", lambda e: self.showQuickOpen())
+            self.bind_all("<Control-Tab>", lambda e: self.nextTab())
+            self.bind_all("<Control-Shift-Tab>", lambda e: self.prevTab())
 
     def _setMenuLabel(self, menu, match, newlabel):
         """Change a menu entry's label by substring match (index-independent)."""
@@ -1631,6 +1830,9 @@ class CocoIDE(tk.Frame):
 
     #### Tooltips (macOS-style hover help) -------------------------------------
     def _showTip(self, widget, textfn, event=None):
+        """macOS 'help-book' style tooltip: rounded dark bubble with white text.
+        Own-drawn Canvas pill (a plain Label would render as a grey/white box
+        whose light-on-light text is invisible)."""
         self._hideTip()
         try:
             txt = textfn() if callable(textfn) else textfn
@@ -1638,17 +1840,61 @@ class CocoIDE(tk.Frame):
             return
         if not txt:
             return
+        # position near the widget (or the mouse when we have an event),
+        # clamped inside the screen so the bubble is never cut off
+        try:
+            root = widget.winfo_toplevel()
+            scr_w, scr_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        except Exception:
+            scr_w, scr_h = 1920, 1080
+        mx = event.x_root if event is not None else widget.winfo_rootx() \
+                                                + widget.winfo_width() + 6
+        my = event.y_root if event is not None else widget.winfo_rooty() - 4
         tw = tk.Toplevel(self)
         tw.wm_overrideredirect(True)
-        try: tw.attributes("-topmost", True)
-        except Exception: pass
-        x = widget.winfo_rootx() + widget.winfo_width() + 6
-        y = widget.winfo_rooty() - 4
+        try:
+            tw.attributes("-topmost", True)
+            tw.attributes("-alpha", 0.95)
+        except Exception:
+            pass
+        BG, FG = "#3a3a3c", "#ffffff"          # dark bubble, WHITE text
+        tw.configure(bg=BG, highlightthickness=0)
+        cv = tk.Canvas(tw, bg=BG, highlightthickness=0, bd=0)
+        cv.pack()
+        fnt = getattr(self, "tipfont", None) or ("TkDefaultFont", 10)
+        # measure text width with a throwaway item (create_text returns the
+        # item id as an int - it has no .bbox(); use cv.bbox(id) instead)
+        def textw(s):
+            _id = cv.create_text(0, 0, text=s, font=fnt)
+            bb = cv.bbox(_id)
+            cv.delete(_id)
+            return bb[2] - bb[0] if bb else 0
+        pad, lh = 12, 19
+        lines = []
+        for raw in str(txt).split("\n"):
+            words, cur = raw.split(), ""
+            for w in words:
+                trial = (cur + " " + w).strip()
+                if textw(trial) > 400:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+                else:
+                    cur = trial
+            lines.append(cur)
+        W = max(textw(s) for s in lines) + 2*pad
+        H = len(lines)*lh + 2*pad - (lh - 14)
+        r = min(10, H//2, W//2)                 # rounded corners -> macOS bubble
+        cv.configure(width=W, height=H)
+        pts = [r, 0, W-r, 0, W, r, W, H-r, W-r, H, r, H, 0, H-r, 0, r]
+        cv.create_polygon(*pts, smooth=True, splinesteps=36, fill=BG, outline=BG)
+        for i, s in enumerate(lines):
+            cv.create_text(pad, pad + i*lh, anchor="nw", text=s,
+                           font=fnt, fill=FG, justify=tk.LEFT)
+        tw.update_idletasks()
+        x = min(max(0, mx + 12), scr_w - W - 8)
+        y = min(max(0, my + 14), scr_h - H - 8)
         tw.wm_geometry("+%d+%d" % (x, y))
-        tk.Label(tw, text=txt, justify=tk.LEFT, background="#ffffe0",
-                 relief="solid", borderwidth=1, padx=6, pady=4,
-                 font=self.smallfont if hasattr(self, "smallfont") else None,
-                 wraplength=340).pack(ipadx=1, ipady=1)
         self._tipWin = tw
 
     def _hideTip(self, event=None):
@@ -2176,6 +2422,7 @@ class CocoIDE(tk.Frame):
                 if rp and os.path.isdir(rp):
                     self.projectPath = rp
                     self.rootProjectPath = rp
+            self._savedExpandedDirs = [p for p in cfg.get("expandedDirs", [])]
             if "autocomplete" in cfg:
                 self.acEnabled = bool(cfg["autocomplete"])
         except Exception:
@@ -2194,8 +2441,9 @@ class CocoIDE(tk.Frame):
                 pass
             cfg = {"recentProjects": self.recentProjects[:10],
                    "recentFiles": self.openedFiles[:15],
-                   "project": self.projectPath or "",
+                   "project": self.rootProjectPath or "",
                    "rootProject": self.rootProjectPath or "",
+                   "expandedDirs": sorted(self.expandedDirs)[:40],
                    "startupFolder": self.startupFolder or "",
                    "autocomplete": bool(getattr(self, "acEnabled", True)),
                    "windowGeom": geom}
@@ -2262,9 +2510,13 @@ class CocoIDE(tk.Frame):
         if not os.path.isdir(folder):
             messagebox.showerror("Project", "Folder not found:\n" + folder)
             return
+        same_root = (folder == self.rootProjectPath)
         self.projectPath = folder
         self.rootProjectPath = folder
-        self.expandedDirs = {folder}   # auto-expand the root itself
+        if not same_root:
+            self.expandedDirs = {folder}   # auto-expand the root itself
+        else:
+            self.expandedDirs.add(folder)  # keep previously expanded sub-folders
         self.startupFolder = folder
         if folder not in self.recentProjects:
             self.recentProjects.insert(0, folder)
@@ -2346,7 +2598,6 @@ class CocoIDE(tk.Frame):
         except Exception as e:
             messagebox.showerror("New File", "Could not create file:\n%s" % e)
             return "break"
-        self.file_new()
         self.file_open(filepath=filepath)
         self._populateProjectTree()
         return "break"
@@ -2402,8 +2653,11 @@ class CocoIDE(tk.Frame):
         self.projCanvas.bind('<Configure>', _conf_canvas)
         self._bindMouseWheel(self.projCanvas)
 
-        # Insert into the layout as column 0 (editor shifts to column 1 etc.)
-        panel.grid(row=0, column=0, sticky="nsew", rowspan=3)
+        # Insert into the layout as column 0 (editor shifts to column 1 etc.).
+        # IMPORTANT: only span rows 0-1 (editor + machine code). Row 2 holds the
+        # Memory Watches panel; if the sidebar spanned it too, its 190px column
+        # would cover the watches and they could never be seen/scrolled.
+        panel.grid(row=0, column=0, sticky="nsew", rowspan=2)
         self.mainPanel.grid_columnconfigure(0, minsize=190)
         # NOTE: do NOT add weight to the sidebar column. The editor column keeps
         # weight=1, so resizing the window never "jitters" the whole layout.
@@ -2489,6 +2743,36 @@ class CocoIDE(tk.Frame):
         m.tk_popup(event.x_root, event.y_root)
         return "break"
 
+    def revealInTree(self, filepath):
+        """Expand every ancestor folder of *filepath* inside the tree (root
+        stays untouched), highlight the active file and scroll it into view."""
+        root = self.rootProjectPath or self.projectPath
+        if not root:
+            return
+        d = os.path.dirname(os.path.abspath(filepath))
+        guard = 0
+        while d and d.startswith(root) and d != root and guard < 40:
+            self.expandedDirs.add(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+            guard += 1
+        self._populateProjectTree()
+        # scroll the row of the currently-open file into view
+        try:
+            for child in self.projFrame.winfo_children():
+                txt = child.cget("text")
+                if isinstance(txt, str) and txt.strip().lstrip("\u25CF").strip() \
+                        == os.path.basename(filepath):
+                    self.projCanvas.update_idletasks()
+                    total = max(1, self.projFrame.winfo_reqheight())
+                    frac = child.winfo_y() / float(total)
+                    self.projCanvas.yview_moveto(max(0.0, min(frac - 0.1, 1.0)))
+                    break
+        except Exception:
+            pass
+
     def new_file_in_dir(self, dirpath):
         """Create a new .asm file inside dirpath and open it in the editor."""
         filepath = filedialog.asksaveasfilename(title="New File in Folder",
@@ -2507,16 +2791,7 @@ class CocoIDE(tk.Frame):
             messagebox.showerror("New File", "Could not create file:\n%s" % e)
             return
         self.file_new()
-        self.file_open(filepath=filepath)
-        # make sure the containing folder is visible in the tree
-        d = os.path.dirname(filepath)
-        while d and d.startswith(str(self.rootProjectPath or "")):
-            self.expandedDirs.add(d)
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        self._populateProjectTree()
+        self.file_open(filepath=filepath)   # reveals the path in the tree too
 
     def _populateProjectTree(self, event=None):
         """Fill the sidebar with the *full* project tree under the opened root
@@ -2554,16 +2829,13 @@ class CocoIDE(tk.Frame):
             l.grid(row=row[0], column=0, sticky="ew")
             if command:
                 l.bind("<Button-1>", command)
-                # hover highlight only when the pointer actually moves over the
+                # Hover highlight only when the pointer actually moves over the
                 # row (plain <Enter> fires on every tree rebuild and produced an
-                # event storm that froze the UI). Also show a tooltip with the
-                # full path / action hint (long task names get truncated).
-                def _bindHover(w, tipfn):
-                    w.bind("<Motion>", lambda e, ww=w: self._projHover(ww, True))
-                    w.bind("<Leave>", lambda e, ww=w: (self._projHover(ww, False),
-                                                       self._hideTip()))
-                    w.bind("<Enter>", lambda e, ww=w, tf=tipfn: self._showTip(ww, tf))
-                _bindHover(l, tip)
+                # event storm that froze the UI). No tooltips in the project
+                # tree: they were empty/invisible boxes with no real value -
+                # full paths are shown in the window title bar instead.
+                l.bind("<Motion>", lambda e, ww=l: self._projHover(ww, True))
+                l.bind("<Leave>", lambda e, ww=l: self._projHover(ww, False))
             if rclick:
                 l.bind("<Button-2>", rclick)          # macOS 2-finger click
                 l.bind("<Button-3>", rclick)
@@ -2632,13 +2904,22 @@ class CocoIDE(tk.Frame):
             mark = "\u25CF " if full == self.file_path else "   "
             lbl = addLabel(mark+name, fg="#0b6e0b", indent=depth,
                            command=lambda e, p=full: self.file_open(filepath=p),
-                           tip=lambda f=full: f + "\nClick: open in editor")
+                           tip=lambda f=full: f + "\nClick: open in editor tab")
             if full == self.file_path:
                 lbl.config(font=bold)
         for name, full in otherFiles:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in (".txt", ".md", ".log", ".obj", ".s", ""):
+                act, hint = ("\nClick: open in Machine Code tab",
+                             lambda e, p=full: self.openFileInTab(p))
+            elif ext in (".pdf", ".doc", ".docx"):
+                act, hint = ("\nClick: open in system viewer",
+                             lambda e, p=full: self.openExternalFile(p))
+            else:
+                act, hint = ("\nClick: open in system viewer",
+                             lambda e, p=full: self.openExternalFile(p))
             addLabel("   " + name, fg="#5555aa", indent=depth,
-                     command=lambda e, p=full: self.openExternalFile(p),
-                     tip=lambda f=full: f + "\nClick: open with system viewer")
+                     command=hint, tip=lambda f=full, a=act: f + a)
 
     def openExternalFile(self, filepath):
         """Open non-asm project files (PDF briefs, READMEs...) with the system viewer."""
@@ -2651,6 +2932,482 @@ class CocoIDE(tk.Frame):
                 subprocess.Popen(["xdg-open", filepath])
         except Exception as e:
             print("Could not open", filepath, e)
+
+    #### Bottom tab strip (Machine Code + opened files)  ##################
+
+    def _rebuildMcodeTabBar(self):
+        """Redraw the small tab bar above the Machine Code panel."""
+        for w in self.mcodeTabBar.winfo_children():
+            w.destroy()
+        self.tabButtons = {}
+        boldf = getattr(self, "boldfont", None) or ("TkDefaultFont", 10, "bold")
+        normf = getattr(self, "smallfont", None) or ("TkDefaultFont", 10)
+        for key, path in self.viewTabs:
+            label = "Machine Code" if key == "__mcode__" else os.path.basename(path)
+            active = (key == self.activeViewTab)
+            cell = tk.Frame(self.mcodeTabBar,
+                            bg="#ffffff" if active else "#e6e6e6",
+                            highlightbackground="#cccccc",
+                            highlightthickness=1)
+            cell.pack(side=tk.LEFT, fill=tk.Y)
+            lbl = tk.Label(cell, text=label, padx=8, pady=2, cursor="hand2",
+                           bg=cell.cget("bg"), fg="#222222" if active else "#666666",
+                           font=boldf if active else normf)
+            lbl.pack(side=tk.LEFT)
+            lbl.bind("<Button-1>", lambda e, k=key: self.selectViewTab(k))
+            if key != "__mcode__":
+                x = tk.Label(cell, text="\u2715", padx=4, pady=2, cursor="hand2",
+                             bg=cell.cget("bg"), fg="#888888", font=normf)
+                x.pack(side=tk.LEFT)
+                x.bind("<Button-1>", lambda e, k=key: self.closeViewTab(k))
+            self.tabButtons[key] = cell
+        # stretchy filler so tabs don't span the whole width
+        tk.Frame(self.mcodeTabBar, bg="#e6e6e6").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def selectViewTab(self, key):
+        self.activeViewTab = key
+        try:
+            self._mcodeFrame.tk_raise() if key == "__mcode__" else None
+        except Exception:
+            pass
+        # show/hide content frames
+        self._mcodeFrame.grid(row=0, column=0, sticky="nsew")
+        for fp, fr in self._fileTabFrames.items():
+            if fp == key:
+                fr.grid(row=0, column=0, sticky="nsew")
+                fr.tkraise()
+            else:
+                fr.grid_remove()
+        if key == "__mcode__":
+            self._mcodeFrame.tkraise()
+        self._rebuildMcodeTabBar()
+
+    def openFileInTab(self, filepath):
+        """Open a project file as a new tab in the bottom area (idempotent)."""
+        if filepath in self.viewTabs:
+            self.selectViewTab(filepath)
+            return
+        self.viewTabs.append((filepath, filepath))
+        frame = tk.Frame(self.mcodeTabStack, bg="white")
+        frame.grid(row=0, column=0, sticky="nsew")
+        txt = tk.Text(frame, wrap=tk.NONE, font=self.defaulttxtfont, bg="white",
+                      relief=tk.FLAT, bd=0)
+        vs = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=txt.yview)
+        hs = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.config(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        vs.pack(side=tk.RIGHT, fill=tk.Y)
+        hs.pack(side=tk.BOTTOM, fill=tk.X)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        txt.bind("<Key>", lambda e: "break")   # read-only listing
+        self._bindMouseWheel(txt)
+        title = tk.Label(frame, text=os.path.basename(filepath), anchor="w",
+                         bg="#f2f2f2", font=self.smallfont, padx=4)
+        title.place(relx=1.0, rely=0.0, anchor="ne")
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                txt.insert("1.0", f.read())
+        except Exception as ex:
+            txt.insert("1.0", "Cannot display this file inline:\n%s" % ex)
+        txt.edit_modified(False)
+        self._fileTabFrames[filepath] = frame
+        self.selectViewTab(filepath)
+
+    def closeViewTab(self, key):
+        if key == "__mcode__":
+            return
+        self.viewTabs = [t for t in self.viewTabs if t[0] != key]
+        fr = self._fileTabFrames.pop(key, None)
+        if fr:
+            try: fr.destroy()
+            except Exception: pass
+        if self.activeViewTab == key:
+            self.selectViewTab("__mcode__")
+        else:
+            self._rebuildMcodeTabBar()
+
+    def closeAllFileTabs(self):
+        """Called on compile: bring focus back to the Machine Code listing."""
+        if self.viewTabs and self.activeViewTab != "__mcode__":
+            self.selectViewTab("__mcode__")
+
+    #### Editor tabs (VS Code style multiple open files)  #################
+
+    def _onTextModifiedFlag(self, event=None):
+        """<<Modified>> virtual event: keep the active tab's dirty dot fresh."""
+        try:
+            if self._tabSwapGuard:
+                return
+            mod = self.asstxt.edit_modified()
+            if mod and self.editorTabs:
+                self.editorTabs[self.activeTab]["dirty"] = True
+                self._rebuildEditorTabBar()
+                self.set_title()
+            self.asstxt.edit_modified(False)   # reset so we get the event again
+        except Exception:
+            pass
+
+    def _rebuildEditorTabBar(self):
+        if not hasattr(self, "editorTabBar"):
+            return
+        for w in self.editorTabBar.winfo_children():
+            w.destroy()
+        boldf = getattr(self, "boldfont", None) or ("TkDefaultFont", 10, "bold")
+        normf = getattr(self, "smallfont", None) or ("TkDefaultFont", 10)
+        for i, tab in enumerate(self.editorTabs):
+            active = (i == self.activeTab)
+            name = ("\u25cf " if tab["dirty"] else "") + tab["name"]
+            cell = tk.Frame(self.editorTabBar,
+                            bg="#ffffff" if active else "#dcdcdc",
+                            highlightbackground="#bbbbbb", highlightthickness=1)
+            cell.pack(side=tk.LEFT, fill=tk.Y)
+            lbl = tk.Label(cell, text=name, padx=8, pady=2, cursor="hand2",
+                           bg=cell.cget("bg"), fg="#222222" if active else "#666666",
+                           font=boldf if active else normf)
+            lbl.pack(side=tk.LEFT)
+            lbl.bind("<Button-1>", lambda e, k=i: self.switchToTab(k))
+            x = tk.Label(cell, text="\u2715", padx=4, pady=2, cursor="hand2",
+                         bg=cell.cget("bg"), fg="#999999", font=normf)
+            x.pack(side=tk.LEFT)
+            x.bind("<Button-1>", lambda e, k=i: self.closeTab(k))
+        tk.Frame(self.editorTabBar, bg="#e6e6e6").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _storeActiveBuffer(self):
+        """Snapshot current editor content into its tab record."""
+        tab = self.editorTabs[self.activeTab]
+        try:
+            tab["content"] = self.asstxt.get("1.0", tk.END)
+            tab["insert"] = self.asstxt.index(tk.INSERT)
+        except Exception:
+            pass
+
+    def switchToTab(self, idx, event=None):
+        if idx == self.activeTab or not (0 <= idx < len(self.editorTabs)):
+            return "break"
+        self.acHide()
+        self._storeActiveBuffer()
+        self.activeTab = idx
+        tab = self.editorTabs[idx]
+        self._tabSwapGuard = True
+        try:
+            self.file_path = tab["path"]
+            self.asstxt.delete("1.0", tk.END)
+            self.asstxt.insert("1.0", tab.get("content", ""))
+            self.asstxt.mark_set(tk.INSERT, tab.get("insert", "1.0"))
+            self.asstxt.edit_modified(False)
+            self.asstxt.edit_separator()
+            self.highlighter()          # re-parse labels/watch/mcode for this file
+            self.set_title()
+        finally:
+            self._tabSwapGuard = False
+        self._rebuildEditorTabBar()
+        self._populateProjectTree()     # refresh the \u25cf active-file marker
+        return "break"
+
+    def openInNewTab(self, filepath, contents=None):
+        """Open a file as an editor tab (reuse existing tab if already open)."""
+        for i, tab in enumerate(self.editorTabs):
+            if tab["path"] == filepath:
+                return self.switchToTab(i)
+        self._storeActiveBuffer()
+        if contents is None:
+            try:
+                with open(filepath, encoding="utf-8", errors="replace") as f:
+                    contents = f.read()
+            except Exception as ex:
+                messagebox.showerror("Open failed", str(ex))
+                return "break"
+        # replace a pristine empty Untitled tab instead of piling up blanks
+        t = self.editorTabs[self.activeTab]
+        cur = self.asstxt.get("1.0", tk.END).strip()
+        if t["path"] is None and not cur and not t["dirty"]:
+            tab = t
+        else:
+            tab = {"path": None, "name": "", "dirty": False}
+            self.editorTabs.append(tab)
+            self.activeTab = len(self.editorTabs) - 1
+        tab.update({"path": filepath, "name": os.path.basename(filepath),
+                    "dirty": False, "content": contents + "\n",
+                    "insert": "1.0"})
+        self.file_path = filepath
+        self._tabSwapGuard = True
+        try:
+            self.asstxt.delete("1.0", tk.END)
+            self.asstxt.insert("1.0", contents)
+            self.asstxt.edit_modified(False)
+            self.asstxt.edit_reset()
+            self.asstxt.edit_separator()
+            self.mcode_list.delete(1.0, tk.END)
+            self.highlighter()
+            self.asstxt.see("1.0")
+            self.set_title()
+        finally:
+            self._tabSwapGuard = False
+        self._rebuildEditorTabBar()
+        self._populateProjectTree()
+        return "break"
+
+    def closeTab(self, idx, event=None):
+        if not (0 <= idx < len(self.editorTabs)):
+            return "break"
+        tab = self.editorTabs[idx]
+        # flush live edits if closing the visible tab
+        if idx == self.activeTab:
+            self._storeActiveBuffer()
+        if tab["dirty"]:
+            ans = messagebox.askyesno(
+                "Unsaved changes",
+                "'%s' has unsaved changes.\nSave before closing?" % tab["name"])
+            if ans:
+                if idx != self.activeTab:
+                    self.switchToTab(idx)
+                self.file_save()
+                if self.editorTabs[idx]["dirty"]:
+                    return "break"   # save was cancelled
+            elif not ans:
+                pass  # discard
+        self.editorTabs.pop(idx)
+        if not self.editorTabs:      # never leave the strip empty
+            self.editorTabs = [{"path": None, "name": "Untitled", "dirty": False,
+                                "content": "", "insert": "1.0"}]
+        if idx == self.activeTab:
+            self.activeTab = min(idx, len(self.editorTabs) - 1)
+            t = self.editorTabs[self.activeTab]
+            self.file_path = t["path"]
+            self._tabSwapGuard = True
+            try:
+                self.asstxt.delete("1.0", tk.END)
+                self.asstxt.insert("1.0", t.get("content", ""))
+                self.asstxt.edit_modified(False)
+                self.highlighter()
+                self.set_title()
+            finally:
+                self._tabSwapGuard = False
+        elif idx < self.activeTab:
+            self.activeTab -= 1
+        self._rebuildEditorTabBar()
+        self._populateProjectTree()
+        return "break"
+
+    def nextTab(self, event=None):
+        if len(self.editorTabs) > 1:
+            self.switchToTab((self.activeTab + 1) % len(self.editorTabs))
+        return "break"
+
+    def prevTab(self, event=None):
+        if len(self.editorTabs) > 1:
+            self.switchToTab((self.activeTab - 1) % len(self.editorTabs))
+        return "break"
+
+    #### Quick-open file picker (Cmd+P)  ##################################
+
+    def _collectProjectFiles(self, root, limit=3000):
+        out = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                out.append(os.path.join(dirpath, fn))
+                if len(out) >= limit:
+                    return out
+        return out
+
+    def showQuickOpen(self, event=None):
+        root = self.rootProjectPath or self.projectPath
+        if not root or not os.path.isdir(root):
+            self.open_project_dialog()
+            return "break"
+        if getattr(self, "_qoWin", None) and self._qoWin.winfo_exists():
+            self._qoWin.destroy()
+        win = tk.Toplevel(self)
+        self._qoWin = win
+        win.title("Open File")
+        try:
+            win.attributes("-topmost", True)
+            win.transient(self)
+        except Exception:
+            pass
+        win.geometry("+%d+%d" % (self.master.winfo_rootx()+120,
+                                 self.master.winfo_rooty()+120))
+        win.resizable(True, True)
+        ent = tk.Entry(win, font=("Menlo", 14) if platform == "darwin" else ("Courier", 14),
+                       relief=tk.FLAT)
+        ent.pack(fill=tk.X, padx=6, pady=(6, 2))
+        lb = tk.Listbox(win, height=16, width=70, font=self.defaulttxtfont,
+                        activestyle="none", relief=tk.FLAT,
+                        selectbackground="#1a5fb4", selectforeground="white")
+        lb.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        allFiles = self._collectProjectFiles(root)
+        rel = [(os.path.relpath(f, root), f) for f in allFiles]
+        state = {"items": []}
+
+        def refresh(*_):
+            q = ent.get().strip().lower().replace(" ", "")
+            rows = []
+            for r, full in rel:
+                if not q or self._fuzzyScore(q, r) is not None:
+                    score = self._fuzzyScore(q, r) if q else 0
+                    rows.append((score if isinstance(score, int) else 999, r, full))
+            rows.sort(key=lambda it: (it[0], len(it[1])))
+            state["items"] = rows[:60]
+            lb.delete(0, tk.END)
+            for _, r, _f in state["items"]:
+                lb.insert(tk.END, "  " + r)
+            if state["items"]:
+                lb.selection_set(0)
+
+        def openSel(*_):
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(state["items"]):
+                return "break"
+            path = state["items"][sel[0]][2]
+            win.destroy()
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ("", ".asm", ".obj", ".txt", ".s"):
+                self.file_open(filepath=path)
+            else:
+                self.openExternalFile(path)
+            return "break"
+
+        ent.bind("<KeyRelease>", refresh)
+        ent.bind("<Return>", openSel)
+        lb.bind("<Return>", openSel)
+        lb.bind("<Double-Button-1>", openSel)
+        win.bind("<Escape>", lambda e: win.destroy())
+        for seq in ("<Down>", "<Up>"):
+            delta = 1 if seq == "<Down>" else -1
+            def nav(e, d=delta):
+                if not lb.size():
+                    return "break"
+                cur = (lb.curselection() or ((0,),))[0][0]
+                cur = max(0, min(lb.size()-1, cur + d))
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(cur)
+                lb.see(cur)
+                return "break"
+            ent.bind(seq, nav)
+        refresh()
+        ent.focus_set()
+        return "break"
+
+    #### Command palette (Cmd+Shift+P)  ###################################
+
+    def _paletteCommands(self):
+        cmds = [
+            ("Open Folder as Project\u2026", lambda: self.open_project_dialog(), "Cmd+Shift+O"),
+            ("New File in Project", lambda: self.new_file_in_project(), ""),
+            ("New File", lambda: self.file_new(), ""),
+            ("Open File\u2026", lambda: self.file_open(), ""),
+            ("Save", lambda: self.file_save(), ""),
+            ("Save As\u2026", lambda: self.file_save_as(), ""),
+            ("Compile", lambda: self.compileText(), "Cmd+B"),
+            ("Compile & Run", lambda: self.compileRun(), "F5"),
+            ("Run", lambda: self.runProg(), "Cmd+R"),
+            ("Step Once", lambda: self.stepOnce(), ""),
+            ("Toggle Breakpoint at Cursor", lambda: self.toggleBPAtCursor(), ""),
+            ("Clear Breakpoints", lambda: self.clearBPs(), ""),
+            ("Go to Line\u2026", lambda: self.gotoLineDialog(), "Cmd+G"),
+            ("Find\u2026", lambda: self.focusSearchBox(), "Cmd+F"),
+            ("Trigger Completion", lambda: self.acTrigger(), "Cmd+Space"),
+            ("Toggle Auto-completion", lambda: self.toggleAutocomplete(), ""),
+            ("Reveal Project Folder in Finder", lambda: self.reveal_project_folder(), ""),
+            ("Open Terminal in Project Folder", lambda: self.open_terminal_here(), ""),
+            ("Close Project", lambda: self.close_project(), ""),
+            ("Show Manual", lambda: self.helpwin(), ""),
+            ("About CocoIDE", lambda: self.aboutDialog(), ""),
+        ]
+        # recent projects & files become palette entries too
+        for p in (self.recentProjects or [])[:6]:
+            name = os.path.basename(p) or p
+            cmds.append(("Project: " + name, lambda path=p: self.set_project(path), ""))
+        for fp in (self.openedFiles or [])[:8]:
+            nm = os.path.basename(fp)
+            par = os.path.basename(os.path.dirname(fp))
+            cmds.append(("Open: %s (%s)" % (nm, par),
+                         lambda path=fp: self.file_open(filepath=path), ""))
+        return cmds
+
+    def _fuzzyScore(self, query, text):
+        """Simple subsequence fuzzy match; lower = better, None = no match."""
+        q = query.lower().replace(" ", "")
+        t = text.lower()
+        if not q:
+            return 0
+        pos, score = -1, 0
+        for ch in q:
+            pos = t.find(ch, pos + 1)
+            if pos == -1:
+                return None
+            score += pos  # prefer early matches
+        return score
+
+    def showCmdPalette(self, event=None):
+        if getattr(self, "_paletteWin", None) and self._paletteWin.winfo_exists():
+            self._paletteWin.destroy()
+        win = tk.Toplevel(self)
+        self._paletteWin = win
+        win.title("Command Palette")
+        win.attributes("-topmost", True)
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        w, h = 560, 380
+        try:
+            x = self.master.winfo_rootx() + max(0, (self.master.winfo_width() - w)//2)
+            y = self.master.winfo_rooty() + 120
+        except Exception:
+            x, y = 200, 200
+        win.geometry("+%d+%d" % (x, y))
+        win.resizable(False, False)
+        ent = tk.Entry(win, font=("Menlo", 14) if platform == "darwin" else ("Courier", 14),
+                       relief=tk.FLAT)
+        ent.pack(fill=tk.X, padx=6, pady=(6, 2))
+        lb = tk.Listbox(win, height=14, font=self.defaulttxtfont, activestyle="none",
+                        relief=tk.FLAT, selectbackground="#1a5fb4", selectforeground="white")
+        lb.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        cmds = self._paletteCommands()
+        state = {"items": []}
+
+        def refresh(*_):
+            q = ent.get().strip()
+            lb.delete(0, tk.END)
+            items = []
+            for c in cmds:
+                sc = self._fuzzyScore(q, c[0]) if q else 0
+                if q and sc is None:
+                    continue
+                items.append((sc, c))
+            items.sort(key=lambda it: it[0])
+            state["items"] = [c for _, c in items][:40]
+            for name, _, acc in state["items"]:
+                lb.insert(tk.END, ("  %-46s %s" % (name, acc)).rstrip())
+            if state["items"]:
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(0)
+
+        def runSel(*_):
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(state["items"]):
+                return "break"
+            win.destroy()
+            self.after(30, state["items"][sel[0]][1])
+            return "break"
+
+        ent.bind("<KeyRelease>", refresh)
+        ent.bind("<Down>", lambda e: (lb.selection_clear(0, tk.END),
+                                      lb.selection_set(min(lb.size()-1, (lb.curselection() or ((-1,)),)[0][0]+1)),
+                                      lb.see(tk.ACTIVE), "break")[3] if lb.size() else "break")
+        ent.bind("<Up>", lambda e: (lb.selection_clear(0, tk.END),
+                                    lb.selection_set(max(0, (lb.curselection() or ((0,),))[0][0]-1)),
+                                    lb.see(tk.ACTIVE), "break")[3] if lb.size() else "break")
+        ent.bind("<Return>", runSel)
+        lb.bind("<Return>", runSel)
+        lb.bind("<Double-Button-1>", runSel)
+        win.bind("<Escape>", lambda e: win.destroy())
+        refresh()
+        ent.focus_set()
+        return "break"
 
     def _bindMouseWheel(self, widget):
         """Two-finger scroll on macOS (MouseWheel/delta) and Linux (buttons 4/5)."""
@@ -3064,6 +3821,13 @@ class CocoIDE(tk.Frame):
             pass
         return idx
 
+    def _returnHandler(self, event=None):
+        """<Return>: accept a completion candidate when the popup is open.
+        Returns None otherwise so Tk's class binding inserts the newline."""
+        if self.acIsVisible():
+            return self.acAccept()
+        return None
+
     def acAccept(self, event=None):
         """Insert the highlighted candidate (Tab / Enter)."""
         if not self.acIsVisible():
@@ -3382,6 +4146,28 @@ class CocoIDE(tk.Frame):
             return True
 
     def file_new(self, event=None):
+        # VS Code style: New File opens a fresh Untitled TAB; the current
+        # buffer is kept (not destroyed) as another tab.
+        if getattr(self, "editorTabs", None):
+            self._storeActiveBuffer()
+            blank = {"path": None, "name": "Untitled", "dirty": False,
+                     "content": "", "insert": "1.0"}
+            self.editorTabs.append(blank)
+            self.activeTab = len(self.editorTabs) - 1
+            self.file_path = None
+            self._tabSwapGuard = True
+            try:
+                self.asstxt.delete(1.0, tk.END)
+                self.asstxt.edit_modified(False)
+                self.asstxt.edit_reset()
+                self.asstxt.edit_separator()
+                self.mcode_list.delete(1.0, tk.END)
+                self.highlighter()
+                self.set_title()
+            finally:
+                self._tabSwapGuard = False
+            self._rebuildEditorTabBar()
+            return "break"
         result = self.save_if_modified()
         if result != None: #None => Aborted or Save cancelled, False => Discarded, True = Saved or Not modified
             self.asstxt.delete(1.0, "end")
@@ -3426,27 +4212,28 @@ class CocoIDE(tk.Frame):
                             fileContents = f.read()# Get all the text from file.
                     except:
                         pass
-                # Set current text to file contents
-                if fileContents != "":
-                    self.asstxt.delete(1.0, "end")
-                    self.asstxt.edit_reset()
-                    self.asstxt.edit_separator()
-                    self.mcode_list.delete(1.0, tk.END)
-                    self.asstxt.insert(1.0, fileContents)
-                    self.asstxt.edit_modified(False)
-                    self.file_path = filepath
-                    self.set_title()
+                # Set current text to file contents (in an editor tab)
+                if fileContents != "" or os.path.isfile(filepath):
+                    self.openInNewTab(filepath, contents=fileContents)
                     self.changed=True
-                    self.highlighter()
-                    self.asstxt.see("1.0")
-                    # Track recents & auto-open the containing folder as project
+                    # Track recents. Opening a file NEVER replaces the project
+                    # root (VS Code behaviour): we only expand the tree so the
+                    # opened file's folder is visible and the file is marked.
                     if filepath not in self.openedFiles:
                         self.openedFiles.insert(0, filepath)
                     self.openedFiles = self.openedFiles[:15]
                     folder = os.path.dirname(filepath)
-                    if folder != self.projectPath:
+                    root = self.rootProjectPath or self.projectPath
+                    if root and folder.startswith(root + os.sep):
+                        # inside the current project - just reveal it in place
+                        self.revealInTree(filepath)
+                    elif not root:
+                        # no project open yet: adopt the file's folder as root
                         self.set_project(folder)
+                        self.revealInTree(filepath)
                     else:
+                        # file lives outside the project: keep the project as is,
+                        # just refresh the recent-files menu
                         self._rebuildRecentMenu()
                         self._populateProjectTree()
                     self.saveConfig()
@@ -3504,6 +4291,18 @@ class CocoIDE(tk.Frame):
                 self.asstxt.edit_modified(False)
                 self.file_path = os.path.abspath(filepath)
                 self.startupFolder = os.path.dirname(self.file_path)
+                # keep the editor-tab strip in sync with the saved file
+                if getattr(self, "editorTabs", None):
+                    t = self.editorTabs[self.activeTab]
+                    if t["path"] is None:
+                        t["name"] = os.path.basename(self.file_path)
+                    t["path"] = self.file_path
+                    t["dirty"] = False
+                    try:
+                        t["content"] = self.asstxt.get("1.0", tk.END)
+                    except Exception:
+                        pass
+                    self._rebuildEditorTabBar()
                 if self.file_path not in self.openedFiles:
                     self.openedFiles.insert(0, self.file_path)
                 self.openedFiles = self.openedFiles[:15]
@@ -3776,6 +4575,13 @@ class CocoIDE(tk.Frame):
     def compileText(self, event=None):
         #print("Compiling")
         self.changed=False
+        # bring the listing (Machine Code tab) to front if a file tab is shown
+        try:
+            if getattr(self, "viewTabs", None) \
+                    and self.activeViewTab != "__mcode__":
+                self.selectViewTab("__mcode__")
+        except Exception:
+            pass
         if self.running:
             self.running = False
             self.Emu.HALT = True
@@ -3790,6 +4596,12 @@ class CocoIDE(tk.Frame):
         self.statusMsg.config(text="")
          # Clear errLine tag from asstxt window
         self.asstxt.tag_delete("err")
+        # error strip: forget marks from the previous compile run
+        try:
+            self._errMarkLines = []
+            self._refreshErrMarks()
+        except Exception:
+            pass
         self.mcode_list.delete(1.0, tk.END)
         self.mcode_list.config(wrap=tk.NONE)
         # Clear memory
@@ -3952,6 +4764,19 @@ class CocoIDE(tk.Frame):
                 msg += (word + " ")
             errorMsg = msg 
             self.statusMsg.config(text=errorMsg)
+
+            # ---- error strip: collect every diagnostic line number -------
+            # The listing pane is filled by cocas with one message per
+            # problem; scan it so the scrollbar shows a tick per error even
+            # when only the first one is highlighted in the editor.
+            try:
+                self._errMarkLines = self.collectErrorLines()
+                if errLineNo and errLineNo not in self._errMarkLines:
+                    self._errMarkLines.append(errLineNo)
+                    self._errMarkLines.sort()
+                self._refreshErrMarks()
+            except Exception:
+                pass
             
             # Then highlight line in text editor where error occurs
             if "On line" in errorMsg:
@@ -3985,11 +4810,87 @@ class CocoIDE(tk.Frame):
         if linend ==None:
             linend = "%s lineend+1c" % (lintxt)
         self.asstxt.tag_delete("err")
+        # VS Code style error strip: repaint the red marks along the
+        # scrollbar gutter for every error/warning line found in the
+        # Machine-Code listing.
+        try:
+            self._refreshErrMarks()
+        except Exception:
+            pass
         if lintxt:
             self.asstxt.tag_add("err", lintxt, linend)#"%s linestart" % (lintxt), "%s lineend+1c" % (lintxt)) # add tag to k
             self.asstxt.tag_config("err", background=cf.errColour)
             self.update()
             self.asstxt.see(lintxt)# scroll to see error line
+
+    #### Error strip (VS Code "problem decorations" on the scrollbar) #####
+    # Small red ticks painted on a thin canvas glued to the right edge of
+    # the editor: one tick per line that the assembler complained about.
+    # Clicking a tick jumps the caret to that line - handy in long listings
+    # where several errors are far apart and only one is visible at a time.
+
+    def _makeErrStrip(self):
+        """Create the strip canvas; call once after asstxt/scrollbar exist."""
+        self.errStrip = tk.Canvas(None, width=10, background="#2b2b2b",
+                                  highlightthickness=0, borderwidth=0)
+        self.errStrip.place(in_=self.asstxt, relx=1.0, x=-13, rely=0.0,
+                            relheight=1.0)
+        self.errStrip.bind("<Button-1>", self._errStripClick)
+        self.errStrip.bind("<Configure>",
+                           lambda e: self._refreshErrMarks())
+        self._errMarkLines = []      # sorted list of problem line numbers
+        self._errTickPos = []         # (ytop, ybot, lineno) for click mapping
+
+    def collectErrorLines(self):
+        """Scan the Machine Code output pane for 'On line N' diagnostics
+        and return the sorted set of reported line numbers."""
+        lines = set()
+        try:
+            txt = self.mcode_list.get("1.0", tk.END)
+        except Exception:
+            return []
+        import re as _re2
+        for m in _re2.finditer(r"[Ll]ine[^\d]{0,4}(\d+)", txt):
+            n = int(m.group(1))
+            if 0 < n <= 100000:
+                lines.add(n)
+        return sorted(lines)
+
+    def _refreshErrMarks(self):
+        if not getattr(self, "errStrip", None):
+            return
+        c = self.errStrip
+        c.delete("all")
+        self._errTickPos = []
+        try:
+            total = int(float(self.asstxt.index("end-1c").split(".")[0]))
+        except Exception:
+            return
+        h = c.winfo_height()
+        if h < 5 or total < 1:
+            return
+        pxPerLine = h / float(total)
+        pad = 1 if pxPerLine > 3 else 0
+        for n in self._errMarkLines:
+            y1 = (n - 1) * pxPerLine + pad
+            y2 = y1 + max(2.0, min(pxPerLine - 2 * pad, 6.0))
+            c.create_rectangle(1, y1, 9, y2, fill="#e05555", outline="")
+            self._errTickPos.append((y1, y2, n))
+
+    def _errStripClick(self, event):
+        """Jump to the error whose tick was clicked (nearest wins)."""
+        best = None
+        bestd = 1e9
+        for (y1, y2, n) in self._errTickPos:
+            d = 0 if y1 <= event.y <= y2 else min(abs(event.y - y1),
+                                                  abs(event.y - y2))
+            if d < bestd:
+                bestd, best = d, n
+        if best is not None:
+            self.asstxt.mark_set(tk.INSERT, "%d.0" % best)
+            self.asstxt.see("%d.0" % best)
+            self.asstxt.focus_set()
+        return "break"
 
     def cocolnk(self, event=None):
         try:
@@ -4102,10 +5003,24 @@ def main():
     parser.add_argument("-P", "--project", dest="project", type=str, default=None,
                         help="Open a folder as project (task directory)")
     args = parser.parse_args()
+    # Frozen macOS apps launched from Finder start in "/"; running the IDE's
+    # folder makes standard.mlb & co. resolvable by every code path (CWD-based
+    # lookups included) without any Terminal involvement.
+    if _isFrozen() and sys.platform == "darwin":
+        try:
+            os.chdir(appDir())
+        except Exception:
+            pass
     Emu = cdm8_emu.CDM8Emu()
     app = CocoIDE(Emu, filename=args.filename)
+    tk._cocoide_root = app          # used by the native About menu handler
     if args.project:
         app.set_project(os.path.abspath(args.project))
+    if sys.platform == "darwin":
+        # Give the Tk window a moment to realize, then take over the macOS
+        # application identity: Dock icon, menu-bar name, bring-to-front.
+        app.after(150, _macActivate)
+        app.after(300, _macInstallAppMenu)
     app.mainloop()
 
 if __name__ == '__main__':
