@@ -122,7 +122,10 @@ import codecs
 import copy
 import json
 import subprocess
-import pyclbr
+try:
+    import pyclbr   # removed in Python 3.13+; only used by legacy code paths
+except ImportError:
+    pyclbr = None
 
 
 # Language hightlight/syntax definitions
@@ -482,12 +485,17 @@ class CocoIDE(tk.Frame):
         self.bind("<<genInterrupt>>", self.interruptHandler)
         
         ## IO Ports 
-        # Get list of Port names from cdm8_io module
-        self.ioPorts = pyclbr.readmodule('cdm8_io')
-        del self.ioPorts["IOport"] # Do not need Super class name
-        #print(self.ioPorts)#debug
-        self.ioPortnames = [ x.name for x in self.ioPorts.values()]
-        self.ioPortnames.sort()
+        # Enumerate port classes directly from the imported cdm8_io module.
+        # (The old pyclbr.readmodule() approach broke inside PyInstaller .app
+        #  bundles: it re-reads the source file and on Python 3.14+ could
+        #  return an empty dict -> KeyError 'IOport' at startup.)
+        import inspect as _inspect
+        self.ioPortclasses = {}
+        for _nm, _ob in vars(cdm8_io).items():
+            if (_inspect.isclass(_ob) and issubclass(_ob, cdm8_io.IOport)
+                    and _ob is not cdm8_io.IOport):
+                self.ioPortclasses[_nm] = _ob
+        self.ioPortnames = sorted(self.ioPortclasses.keys())
         # List to hold dynamically instantiated IOPorts, tk objects and attributes
         self.IOPorts = [] 
 
@@ -784,6 +792,21 @@ class CocoIDE(tk.Frame):
         mainPanel.rowconfigure(0, weight=1)     # Allow text and mcode windows to scale vertically
         mainPanel.columnconfigure(1, weight=1)  # Allow text and watch windows to scale horizontally
         
+        ## Editor tab strip (VS Code style multiple open files).
+        ## It lives in grid row 0 of the editor column and is anchored to the
+        ## TOP edge; the editor itself shares that cell but fills it below the
+        ## bar (see sticky="nsew" + pady offset on asstxt). Row -1 stays free
+        ## for the OUTPUT terminal.
+        self.editorTabBar = tk.Frame(mainPanel, bg="#e6e6e6", height=25)
+        self._etbScroll = 0          # horizontal scroll offset for many tabs
+        # Wheel over the strip scrolls through the tab list when it overflows.
+        if platform == "darwin":
+            self.editorTabBar.bind("<MouseWheel>",
+                                   lambda e: self._etbWheel(e.delta))
+        else:
+            self.editorTabBar.bind("<Button-4>", lambda e: self._etbWheel(120))
+            self.editorTabBar.bind("<Button-5>", lambda e: self._etbWheel(-120))
+
         ## Create the assembly code editor panel
         # Text editor with scrollbar and syntax highlighting
         
@@ -812,7 +835,7 @@ class CocoIDE(tk.Frame):
             self.asstxt.config(tabs="%g %s right" % (_tabpx, "200c"))
         except Exception:
             pass
-        self.asstxt.grid(row=0, column=1, sticky="nsew")
+        self.asstxt.grid(row=0, column=1, sticky="nsew", pady=(26, 0))
         # Scroll bars
         self.vscroll = ttk.Scrollbar(mainPanel, orient=tk.VERTICAL, command=self.yview)
         self.vscroll.grid(row=0, column=2, sticky="ns")
@@ -905,21 +928,11 @@ class CocoIDE(tk.Frame):
         self.activeTab = 0
         self._tabSwapGuard = False
         self._savedBuffers = {}      # path -> (content, insert-index) while inactive
-        # The tab strip lives ABOVE the editor itself: row -1 of column 1 is
-        # the empty gap left by the line-number gutter (row 0 only), so the
-        # bar sits flush over the text area without shifting any other grid
-        # row (moving it into row 2 would collide with Memory Watches).
-        self.editorTabBar = tk.Frame(mainPanel, bg="#e6e6e6", height=25)
-        self.editorTabBar.grid(row=-1, column=1, sticky="ew")
+        # The strip widget itself was created earlier (right after mainPanel);
+        # here we just place it. Anchored to the TOP of the editor cell so it
+        # sits directly above the text area without shifting any grid row.
+        self.editorTabBar.grid(row=0, column=1, sticky="n")
         self.editorTabBar.grid_propagate(False)
-        self._etbScroll = 0          # horizontal scroll offset for many tabs
-        # Wheel over the strip scrolls through the tab list when it overflows.
-        if platform == "darwin":
-            self.editorTabBar.bind("<MouseWheel>",
-                                   lambda e: self._etbWheel(e.delta))
-        else:
-            self.editorTabBar.bind("<Button-4>", lambda e: self._etbWheel(120))
-            self.editorTabBar.bind("<Button-5>", lambda e: self._etbWheel(-120))
         self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
 
         # Status/Run time warning/Error pane - a LOG TERMINAL (PyCharm/VS Code
@@ -927,11 +940,11 @@ class CocoIDE(tk.Frame):
         # clipped long compiler messages because it lived inside the fixed
         # button bar; now the full diagnostic (with every hint line) is here.
         self.logFrame = tk.Frame(mainPanel, bg="#1e1e1e")
-        # The Machine Code tab area (row 0, col 3) already owns row -1; the
-        # terminal goes to the same row but in column 2 - directly under the
-        # editor, where the old clipped one-line status label used to be.
-        self.logFrame.grid(row=-1, column=2, sticky="nsew")
-        mainPanel.rowconfigure(-1, weight=0, minsize=96)   # fixed-height terminal
+        # OUTPUT terminal occupies its own grid row (row 4) directly below the
+        # editor/watches area. Negative rows are not supported by Tk, so we
+        # use a fresh positive row instead of the old row=-1 hack.
+        self.logFrame.grid(row=4, column=0, columnspan=4, sticky="nsew")
+        mainPanel.rowconfigure(4, weight=0, minsize=96)   # fixed-height terminal
         mainPanel.columnconfigure(2, weight=0, minsize=240)
         logHead = tk.Label(self.logFrame, text="  OUTPUT", anchor="w",
                            bg="#2d2d2d", fg="#bbbbbb",
@@ -3754,12 +3767,36 @@ class CocoIDE(tk.Frame):
         elif "invalid opcode" in low:
             m = _re.search(r"invalid opcode:\s*(\S+)", low)
             bad = m.group(1) if m else opcode
-            cands = [k for k in cocas.iset if k.startswith(bad[:2])]
-            hint = ("'%s' is not a CDM8 instruction or defined macro." % bad)
-            if cands:
-                hint += " Did you mean: " + ", ".join(sorted(cands)[:8]) + "?"
-            hint += ("\nRemember: load-immediate is 'ldi', jump-to-subroutine "
-                     "is 'jsr', conditional jumps are 'beq/bne/blt/...'.")
+            # Common foreign-assembler directives that CDM8 does not know,
+            # with the right CDM8 equivalent spelled out.
+            foreign = {
+                "org":  ("Set the start address with a section instead:\n"
+                         "    asect main $200   ; absolute section at $200\n"
+                         "    rsect main        ; place code there"),
+                "equ":  ("No .EQU in CDM8 — use labels and 'ldi':\n"
+                         "    ldi r0, $20     (or define a data label with dc)"),
+                "db":   ("Define constants inside a section with 'dc':\n"
+                         "    asect data / rsect data / myval dc $1F"),
+                "dw":   ("Use 'dc' for a word constant inside an asect/rsect."),
+                "ds":   ("Reserve space with the 'ds' directive inside a section."),
+                "end":  ("'END' is not needed by this assembler; it simply\n"
+                         "reads the whole file."),
+                "global":"CDM8 is single-file — no linkage directives.",
+                "section":"Use 'asect <name> <addr>' + 'rsect <name>'.",
+                ".text": "Use 'asect'/'rsect' sections.",
+                ".data": "Use 'asect'/'rsect' sections.",
+                ".globl":"CDM8 is single-file — no linkage directives.",
+            }
+            if bad in foreign:
+                hint = ("'%s' is not a CDM8 directive/instruction.\n%s"
+                        % (bad, foreign[bad]))
+            else:
+                cands = [k for k in cocas.iset if k.startswith(bad[:2])]
+                hint = ("'%s' is not a CDM8 instruction or defined macro." % bad)
+                if cands:
+                    hint += " Did you mean: " + ", ".join(sorted(cands)[:8]) + "?"
+                hint += ("\nRemember: load-immediate is 'ldi', jump-to-subroutine "
+                         "is 'jsr', conditional jumps are 'beq/bne/blt/...'.")
 
         elif "only one operand expected" in low:
             form = self._diagForm(opcode)
