@@ -464,6 +464,7 @@ class CocoIDE(tk.Frame):
         self._lastRegVals = [None]*4   # last shown r0-r3 values
         self._lastCVZNtxt = None       # last shown PS bit string
         self._pulseIds = {}            # widget -> pending after() id
+        self._pulseBase = {}           # widget -> resting bg while pulsing
         self.bpTagNames = []
         self.runDict = colls.OrderedDict()
         self.cliptext = ""
@@ -799,7 +800,8 @@ class CocoIDE(tk.Frame):
         # Text editor window
         self.asstxt = tk.Text(mainPanel, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
-                                autoseparators=True, maxundo=-1, width=40)#, height=10,) height=editorHeight,
+                                autoseparators=True, maxundo=-1, width=40,
+                                padright=26)#, height=10,) height=editorHeight,
         self.asstxt.grid(row=0, column=1, sticky="nsew")
         # Scroll bars
         self.vscroll = ttk.Scrollbar(mainPanel, orient=tk.VERTICAL, command=self.yview)
@@ -809,11 +811,26 @@ class CocoIDE(tk.Frame):
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
         # VS Code style error strip (red ticks on the scrollbar gutter).
-        # Created after asstxt exists; placed over the editor's right edge.
+        # Created after asstxt exists; placed in the padright gutter so it
+        # never covers text (the Text widget reserves 26 px of empty margin
+        # at its right edge - see padright above). The strip itself is
+        # transparent: only the red tick marks are drawn, over the gutter's
+        # background colour.
         try:
             self._makeErrStrip()
         except Exception:
             pass
+
+        # Up/Down arrows must keep moving the caret even when the completion
+        # popup is open (user complaint: AC module "stole" vertical cursor
+        # movement). Navigation inside the listbox uses Ctrl/Cmd+Up/Down and
+        # mouse clicks instead - exactly how modern IDEs disambiguate this.
+        def _navArrow(event, delta):
+            if self.acIsVisible():
+                return self.acMoveSel(delta)   # popup open -> browse it
+            return None                        # closed -> plain caret movement
+        self.asstxt.bind("<Up>", lambda e: _navArrow(e, -1))
+        self.asstxt.bind("<Down>", lambda e: _navArrow(e, 1))
         
         # Status-bar cursor position updates (asstxt exists only from here on)
         self.asstxt.bind("<<CaretMove>>", self._updateStatusCursor, add=True)
@@ -921,12 +938,14 @@ class CocoIDE(tk.Frame):
         # the key on a visible popup; returning None here lets Tk's built-in
         # Text class binding insert the newline normally afterwards.
         self.asstxt.bind("<Return>", self._returnHandler)
-        # Explicit widget-level bindings for popup navigation. The <Key> filter
-        # alone is not enough: Tk's built-in Text bindings for Up/Down/Escape
-        # run first and move the caret / close dialogs before we can "break"
-        # them (bindtags order), so the popup would never be navigable.
-        self.asstxt.bind("<Up>", lambda e: self.acMoveSel(-1))
-        self.asstxt.bind("<Down>", lambda e: self.acMoveSel(1))
+        # Popup navigation with Ctrl/Cmd+Up/Down (plain arrows always move the
+        # caret - see _navArrow bound earlier). The <Key> filter still breaks
+        # plain arrows while the popup is open, so they don't double-move.
+        self._safeBind(self.asstxt, "<Control-Up>", lambda e: self.acMoveSel(-1))
+        self._safeBind(self.asstxt, "<Control-Down>", lambda e: self.acMoveSel(1))
+        if platform == "darwin":
+            self._safeBind(self.asstxt, "<Command-Up>", lambda e: self.acMoveSel(-1))
+            self._safeBind(self.asstxt, "<Command-Down>", lambda e: self.acMoveSel(1))
         # Escape: close the popup first (clearEditorHighlights below is bound
         # with add="+" and only runs when acCancel returns None, i.e. closed).
         self.asstxt.bind("<Escape>", self.acCancel)
@@ -1034,8 +1053,7 @@ class CocoIDE(tk.Frame):
         self.pcLab.grid(row=1, column=0, sticky="w")#, columnspan=2)
         self.pcLabVal = tk.Label(self.regPanel, text="00",width=6, bg=cf.PCcolour, relief="sunken", padx=3, font=self.defaulttxtfont)
         self.pcLabVal.grid(row=2, column=0, sticky="w")
-        self.pcLabVal.bind("<Enter>", lambda e: self._showTip(self.pcLabVal, self.tipPC, e))
-        self.pcLabVal.bind("<Leave>", self._hideTip)
+        self._tipBind(self.pcLabVal, self.tipPC)
 
         # PS register (CVZN etc.)
         
@@ -1044,18 +1062,15 @@ class CocoIDE(tk.Frame):
         self.CVZN_Val = tk.Label(self.regPanel, text="0 000 0000", bg="white", width=15, relief="sunken", font=self.defaulttxtfont)
         self.CVZN_Val.grid(row=2, column=1, columnspan=2)#, sticky="e")#, columnspan=2)
         # macOS-style tooltips: live decode of the PS (status) register bits
-        self.CVZN_Lab.bind("<Enter>", lambda e: self._showTip(self.CVZN_Lab, self.tipPS, e))
-        self.CVZN_Lab.bind("<Leave>", self._hideTip)
-        self.CVZN_Val.bind("<Enter>", lambda e: self._showTip(self.CVZN_Val, self.tipPS, e))
-        self.CVZN_Val.bind("<Leave>", self._hideTip)
+        self._tipBind(self.CVZN_Lab, self.tipPS)
+        self._tipBind(self.CVZN_Val, self.tipPS)
 
         # Stack Pointer
         self.spLab = tk.Label(self.regPanel, text=" SP  ",width=7, font=self.boldfont)
         self.spLab.grid(row=1, column=3)#, columnspan=2)
         self.spVal = tk.Label(self.regPanel, text="00", bg=cf.SPcolour, width=7, relief="sunken", font=self.defaulttxtfont)
         self.spVal.grid(row=2, column=3)#, columnspan=2)
-        self.spVal.bind("<Enter>", lambda e: self._showTip(self.spVal, self.tipSP, e))
-        self.spVal.bind("<Leave>", self._hideTip)
+        self._tipBind(self.spVal, self.tipSP)
 
 
         spacer1= tk.Label(self.regPanel, text="")#, height=1)
@@ -1069,8 +1084,7 @@ class CocoIDE(tk.Frame):
         for index in range(4):
             self.regLabs[index] = tk.Label(self.regPanel, text="r"+str(index), width=8, padx=5, fg="blue", font=self.boldfont)
             self.regLabs[index].grid(row=4, column=index, sticky="n")
-            self.regLabs[index].bind("<Enter>", lambda e, i=index: self._showTip(self.regLabs[i], lambda: self.tipReg(i), e))
-            self.regLabs[index].bind("<Leave>", self._hideTip)
+            self._tipBind(self.regLabs[index], lambda i=index: self.tipReg(i))
             self.regHexs[index] = tk.Label(self.regPanel, text="0x00", width=8, bg="white", relief="sunken",font=self.defaulttxtfont)
             self.regHexs[index].grid(row=5, column=index, sticky="n")
             self.regStrs[index] = tk.Label(self.regPanel, text="NUL", width=8, bg="white", relief="sunken",font=self.defaulttxtfont)
@@ -1809,6 +1823,14 @@ class CocoIDE(tk.Frame):
                 base = "#%02x%02x%02x" % base
         except Exception:
             return
+        # Remember the TRUE resting background once. If a new pulse arrives
+        # while an old one is mid-flight, w.cget("bg") would return a pulse
+        # colour and the widget would "freeze" amber forever (the reported
+        # r1/r2 stuck-highlight bug). The first observed bg is authoritative.
+        if w not in self._pulseBase:
+            self._pulseBase[w] = base
+        else:
+            base = self._pulseBase[w]
         old = self._pulseIds.get(w)
         if old:
             try: self.after_cancel(old)
@@ -1818,15 +1840,32 @@ class CocoIDE(tk.Frame):
     def _pulseSeq(self, w, i, base):
         try:
             if not w.winfo_exists():
-                self._pulseIds.pop(w, None); return
+                self._pulseIds.pop(w, None); self._pulseBase.pop(w, None); return
             if i < len(self._PULSE_STEPS):
                 w.config(bg=self._PULSE_STEPS[i])
                 self._pulseIds[w] = self.after(55, lambda: self._pulseSeq(w, i+1, base))
             else:
                 w.config(bg=base)
                 self._pulseIds.pop(w, None)
+                self._pulseBase.pop(w, None)   # allow re-learning after reset
         except Exception:
             self._pulseIds.pop(w, None)
+            self._pulseBase.pop(w, None)
+
+    def stopAllPulses(self):
+        """Cancel every pending animation (halt/stop/reset paths) and restore
+        the resting background of each pulsing widget immediately."""
+        for w, aid in list(getattr(self, "_pulseIds", {}).items()):
+            try: self.after_cancel(aid)
+            except Exception: pass
+            try:
+                base = self._pulseBase.get(w)
+                if base is not None and w.winfo_exists():
+                    w.config(bg=base)
+            except Exception:
+                pass
+        self._pulseIds = {}
+        self._pulseBase = {}
 
     #### Tooltips (macOS-style hover help) -------------------------------------
     def _showTip(self, widget, textfn, event=None):
@@ -1838,7 +1877,10 @@ class CocoIDE(tk.Frame):
             txt = textfn() if callable(textfn) else textfn
         except Exception:
             return
-        if not txt:
+        # Guard against empty bubbles: the old code drew an empty rounded
+        # box whenever the text function returned nothing meaningful -
+        # now we simply do not show a tip at all in that case.
+        if not txt or not str(txt).strip():
             return
         # position near the widget (or the mouse when we have an event),
         # clamped inside the screen so the bubble is never cut off
@@ -1903,6 +1945,49 @@ class CocoIDE(tk.Frame):
         if tw:
             try: tw.destroy()
             except Exception: pass
+
+    def _tipBind(self, widget, textfn):
+        """Attach a hover tooltip to *widget*.
+
+        Uses <Motion> (not <Enter>) with a 400 ms dwell timer: the bubble is
+        created only after the pointer has actually rested on the widget and
+        the text function has been evaluated - this kills both the empty
+        'flash' bubbles and the old white-on-white rendering race."""
+        def _motion(e, w=widget, fn=textfn):
+            if getattr(self, "_tipWidget", None) is not w:
+                self._unscheduleTip()
+                self._tipWidget = w
+                self._tipEvent = e
+                self._tipAfter = self.after(400, lambda: self._tipShow(w, fn))
+            elif self._tipWin is None and e is not None:
+                self._tipEvent = e      # keep latest coords for placement
+        widget.bind("<Motion>", _motion)
+        widget.bind("<Leave>", lambda e: self._leaveTipWidget(widget), add="+")
+        widget.bind("<ButtonPress>", lambda e: self._leaveTipWidget(widget), add="+")
+
+    def _unscheduleTip(self):
+        aid = getattr(self, "_tipAfter", None)
+        self._tipAfter = None
+        if aid:
+            try: self.after_cancel(aid)
+            except Exception: pass
+
+    def _leaveTipWidget(self, widget=None, event=None):
+        if widget is None or getattr(self, "_tipWidget", None) is widget \
+                or widget is None:
+            self._unscheduleTip()
+            self._tipWidget = None
+            self._hideTip()
+        return None
+
+    def _tipShow(self, widget, textfn):
+        self._tipAfter = None
+        try:
+            if not widget.winfo_exists():
+                return
+        except Exception:
+            return
+        self._showTip(widget, textfn, getattr(self, "_tipEvent", None))
 
     def tipPS(self):
         v = self.Emu.CVZN
@@ -2155,6 +2240,8 @@ class CocoIDE(tk.Frame):
 
     def _runStopped(self):
         self.running = False
+        try: self.stopAllPulses()   # no amber cells stuck after Stop/Halt
+        except Exception: pass
         self.updateOPs()
         self.updateDisp()
         self.runStopButton.config(text="Run ", fg="black", activeforeground="black")
@@ -2200,6 +2287,8 @@ class CocoIDE(tk.Frame):
         if self.running:
             self.running = False
             self.Emu.HALT = True
+            try: self.stopAllPulses()   # never leave a frozen amber highlight
+            except Exception: pass
             self._runStopped()
         self.mcode_list.delete(1.0, tk.END)
         self.watchList.delete(1.0, tk.END)
@@ -3751,7 +3840,11 @@ class CocoIDE(tk.Frame):
 
     def _acShowPopup(self):
         if self.acListbox is None:
-            self.acListbox = tk.Listbox(self, height=8, activestyle="none",
+            # Parent it to the editor itself: place() coordinates then belong
+            # to asstxt and the popup lands exactly under the caret. (As a
+            # child of the outer frame it was offset by the line-number
+            # gutter + toolbar rows and appeared near the bottom of the app.)
+            self.acListbox = tk.Listbox(self.asstxt, height=8, activestyle="none",
                                         exportselection=False, relief=tk.RIDGE, bd=1,
                                         font=self.defaulttxtfont, selectbackground="#1a5fb4",
                                         selectforeground="white", highlightthickness=1)
@@ -3773,15 +3866,29 @@ class CocoIDE(tk.Frame):
             bbox = None
         if bbox:
             x, y, h, wdt = bbox
-            gx, gy = self.asstxt.winfo_rootx() + x, self.asstxt.winfo_rooty() + y + h
             lb.config(width=max(16, max(len(s) for s in shown) + 6))
-            lb.place(x=self.winfo_pointerx() - self.winfo_rootx() if False else
-                     gx - self.winfo_rootx(), y=gy - self.winfo_rooty())
+            # coords are relative to asstxt now: caret bbox + its internal
+            # scroll offset (xview/yview give the scrolled-away amount)
+            try:
+                frac_x = float(self.asstxt.xview()[0])
+                frac_y = float(self.asstxt.yview()[0])
+                cw = max(1, int(self.asstxt.cget("width")))
+                ch = max(1, int(self.asstxt.winfo_height()))
+                ox = self.asstxt.winfo_toplevel().winfo_containing(
+                        self.asstxt.winfo_rootx(), self.asstxt.winfo_rooty())
+            except Exception:
+                frac_x = frac_y = 0.0; cw = ch = 1000
+            px = x + frac_x * self.asstxt.winfo_width()
+            py = y + h + frac_y * ch
+            lb.place(x=px, y=py)
             lb.tkraise()
             lb.update_idletasks()
-            # flip above if it would run off the bottom of the screen
+            # flip above the caret if it would run off the bottom of the screen
             if lb.winfo_rooty() + lb.winfo_height() > self.winfo_screenheight():
-                lb.place(y=gy - self.winfo_rooty() - lb.winfo_height() - h)
+                lb.place(y=y + frac_y * ch - lb.winfo_height())
+            # keep it inside the horizontal bounds of the editor area
+            if lb.winfo_rootx() + lb.winfo_width() > self.winfo_rootx() + self.winfo_width():
+                lb.place(x=max(0, px - lb.winfo_width() + wdt))
 
     def acIsVisible(self):
         return self.acListbox is not None and self.acListbox.winfo_exists() \
@@ -4257,11 +4364,17 @@ class CocoIDE(tk.Frame):
         else:
             result = self.file_save_as(filepath=self.file_path)
 
-        self.update()
-        time.sleep(0.5)
-        #if platform != "darwin":
-        self.master.config(cursor="")
-        self.asstxt.config(cursor="")
+        # NOTE: the old 'self.update(); time.sleep(0.5)' froze the event loop
+        # for half a second after every Cmd-S - keystrokes (arrows!) queued up
+        # and only landed once the sleep ended, which looked exactly like
+        # "up/down arrows don't work". Restore the cursor via after() instead.
+        def _restoreCursor():
+            try:
+                self.master.config(cursor="")
+                self.asstxt.config(cursor="")
+            except Exception:
+                pass
+        self.after(80, _restoreCursor)
         return "break"
 
     def file_save_as(self, event=None, filepath=None, ext=".asm", text=None):
@@ -4585,6 +4698,8 @@ class CocoIDE(tk.Frame):
         if self.running:
             self.running = False
             self.Emu.HALT = True
+            try: self.stopAllPulses()   # never leave a frozen amber highlight
+            except Exception: pass
             self._runStopped()
         self.Emu.curPage = 0
         textList=[]
@@ -4750,20 +4865,18 @@ class CocoIDE(tk.Frame):
             if helpTxt:
                 errorMsg = errorMsg + "\n\n" + helpTxt
             # ---- end enhanced diagnostics --------------------------------
-            errorMsg = errorMsg.split(" ")
-            #print(retError)
-            self.mcode_list.delete(1.0, tk.END)
-            self.mcode_list.config(wrap=tk.WORD)
-            #self.mcode_list.insert(tk.END, errorMsg)#[0]+":\n")
-            if len(errorMsg)>6:
-                errorMsg.insert(4, "\n")
-            if len(errorMsg)>10:
-                errorMsg.insert(10, "\n")
-            msg = ""
-            for word in errorMsg:
-                msg += (word + " ")
-            errorMsg = msg 
-            self.statusMsg.config(text=errorMsg)
+            # The full diagnostic goes into the Output log (readable,
+            # wrapped, scrollable); the old status label only ever shows a
+            # one-line summary - it could never fit a multi-paragraph error.
+            try:
+                self.log("ERROR", errorMsg)
+            except Exception:
+                pass
+            _firstLine = errorMsg.splitlines()[0] if errorMsg else "Error"
+            try:
+                self.statusMsg.config(text=_firstLine[:70])
+            except Exception:
+                pass
 
             # ---- error strip: collect every diagnostic line number -------
             # The listing pane is filled by cocas with one message per
@@ -4831,9 +4944,13 @@ class CocoIDE(tk.Frame):
 
     def _makeErrStrip(self):
         """Create the strip canvas; call once after asstxt/scrollbar exist."""
-        self.errStrip = tk.Canvas(None, width=10, background="#2b2b2b",
+        self.errStrip = tk.Canvas(None, width=14,
+                                  background=self.asstxt.cget("background"),
                                   highlightthickness=0, borderwidth=0)
-        self.errStrip.place(in_=self.asstxt, relx=1.0, x=-13, rely=0.0,
+        # sits in the padright=26 gutter *after* the last text column, so a
+        # long comment can never be painted over by the strip itself; only
+        # the small red ticks are drawn on top of the gutter colour
+        self.errStrip.place(in_=self.asstxt, relx=1.0, x=-22, rely=0.0,
                             relheight=1.0)
         self.errStrip.bind("<Button-1>", self._errStripClick)
         self.errStrip.bind("<Configure>",
@@ -4874,7 +4991,7 @@ class CocoIDE(tk.Frame):
         for n in self._errMarkLines:
             y1 = (n - 1) * pxPerLine + pad
             y2 = y1 + max(2.0, min(pxPerLine - 2 * pad, 6.0))
-            c.create_rectangle(1, y1, 9, y2, fill="#e05555", outline="")
+            c.create_rectangle(2, y1, 12, y2, fill="#e05555", outline="")
             self._errTickPos.append((y1, y2, n))
 
     def _errStripClick(self, event):

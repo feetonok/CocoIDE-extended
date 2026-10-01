@@ -46,20 +46,99 @@ def run(cmd, **kw):
     return subprocess.check_call(cmd, cwd=HERE, **kw)
 
 
+def _pip_ok(py):
+    """True if the given interpreter can run 'python -m pip'."""
+    try:
+        subprocess.check_call([py, "-m", "pip", "--version"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _bootstrap_pip(py):
+    """Repair a venv whose pip is missing (some macOS 3.12+ installers /
+    --without-pip environments). Uses ensurepip, then get-pip.py as fallback."""
+    try:
+        run([py, "-m", "ensurepip", "--upgrade", "--default-pip"])
+        if _pip_ok(py):
+            return True
+    except Exception:
+        pass
+    # last resort: download get-pip.py into a temp file and run it
+    import tempfile
+    import urllib.request
+    try:
+        fd, gp = tempfile.mkstemp(suffix=".py")
+        os.close(fd)
+        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", gp)
+        run([py, gp])
+        os.remove(gp)
+        return _pip_ok(py)
+    except Exception:
+        return False
+
+
 def make_venv():
-    """Create ./.venv-build and pip-install pyinstaller there."""
+    """Create ./.venv-build and pip-install pyinstaller there.
+
+    Robust against broken system pythons: if 'python -m venv' produces an
+    environment without pip (or fails outright), we bootstrap pip via
+    ensurepip / get-pip.py; if even that fails, we fall back to installing
+    PyInstaller for the *current* interpreter with --user and use it directly.
+    """
     venv = os.path.join(HERE, ".venv-build")
     py = os.path.join(venv, "bin", "python") if os.name != "nt" \
         else os.path.join(venv, "Scripts", "python.exe")
+    made = False
     if not os.path.exists(py):
         print("Creating build virtualenv in .venv-build ...")
-        run([sys.executable, "-m", "venv", venv])
-    print("Installing PyInstaller ...")
-    run([py, "-m", "pip", "--quiet", "--disable-pip-version-check",
-         "install", "--upgrade", "pip"])
-    run([py, "-m", "pip", "--quiet", "--disable-pip-version-check",
-         "install", "pyinstaller"])
-    return py
+        shutil.rmtree(venv, ignore_errors=True)
+        try:
+            run([sys.executable, "-m", "venv", venv])
+            made = True
+        except Exception as e:
+            print("venv creation failed (%s) - trying --without-pip ..." % e)
+            try:
+                run([sys.executable, "-m", "venv", "--without-pip", venv])
+                made = True
+            except Exception as e2:
+                print("venv unavailable (%s); will use the current Python." % e2)
+                py = None
+    if py and os.path.exists(py):
+        if not _pip_ok(py):
+            print("venv has no working pip - bootstrapping it ...")
+            _bootstrap_pip(py)
+        if _pip_ok(py):
+            print("Installing PyInstaller ...")
+            # NOTE: never 'pip install --upgrade pip' here: on some macOS
+            # python.org builds that leaves site-packages/pip broken
+            # ('No module named pip') and kills the whole build.
+            for attempt in range(2):
+                try:
+                    run([py, "-m", "pip", "--quiet", "--disable-pip-version-check",
+                         "install", "pyinstaller"])
+                    return py
+                except Exception as e:
+                    print("pip install in venv failed (try %d): %s" % (attempt+1, e))
+                    # maybe pip broke mid-install -> re-bootstrap once
+                    if attempt == 0:
+                        _bootstrap_pip(py)
+    # ---- fallback: use the current interpreter -------------------------
+    print("Falling back to the current interpreter: %s" % sys.executable)
+    if not _pip_ok(sys.executable):
+        if not _bootstrap_pip(sys.executable):
+            sys.exit("ERROR: cannot get pip on this Python.\n"
+                     "Install it manually:  python3 -m ensurepip --upgrade\n"
+                     "then re-run:          python3 build_app.py")
+    try:
+        run([sys.executable, "-m", "pip", "--quiet",
+             "--disable-pip-version-check", "install", "pyinstaller"])
+    except Exception:
+        run([sys.executable, "-m", "pip", "--quiet", "--user",
+             "--disable-pip-version-check", "install", "pyinstaller"])
+    return sys.executable
 
 
 def icon_flag():
