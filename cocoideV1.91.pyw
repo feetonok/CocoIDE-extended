@@ -88,7 +88,7 @@ from __future__ import absolute_import, division, print_function
 #           Keyboard, terminal, 
 # V1.8      Paged memory + interrupts. To do gRobotIF, LogisimIF, graphics??,
 
-title = 'CocoIDE V1.91'  # Should be updated to reflect version
+title = 'CocoIDE Extended V2.0'  # Should be updated to reflect version
 
 try:
     # Python 3 tk
@@ -118,6 +118,8 @@ import collections as colls
 import atexit
 import codecs
 import copy
+import json
+import subprocess
 import pyclbr
 
 
@@ -146,6 +148,36 @@ try:
 except ImportError:
     print("No AMES library!")# debug
     amesSession = False
+
+# ---------------------------------------------------------------------------
+# Bundled-app support (PyInstaller / py2app .app and plain Windows .exe)
+# When frozen, __file__ points inside the read-only bundle; keep user files
+# (config, recent projects) next to the executable instead, and make sure
+# bundled data files (standard.mlb, sendfile.py) can be located either way.
+# ---------------------------------------------------------------------------
+def _isFrozen():
+    return getattr(sys, "frozen", False)
+
+def appDir():
+    """Directory of the running program (bundle dir when frozen)."""
+    if _isFrozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def resPath(name):
+    """Path to a data file that ships with the program."""
+    if _isFrozen():
+        # PyInstaller extracts datas into sys._MEIPASS; py2app into Resources
+        for base in (getattr(sys, "_MEIPASS", None),
+                     os.path.join(appDir(), "Resources"),
+                     appDir()):
+            if base:
+                p = os.path.join(base, name)
+                if os.path.exists(p):
+                    return p
+    return os.path.join(appDir(), name)
+
+USERDIR = appDir() if _isFrozen() else os.path.expanduser("~")
     #raise # debug
 
 class CreateToolTip(object):
@@ -286,7 +318,6 @@ class CocoIDE(tk.Frame):
         self.TITLE = title
         self.master.title(self.TITLE)
         self.master.protocol("WM_DELETE_WINDOW",self.close_window) # Overide default quit
-        self.master.geometry("1200x600")
         self.master.config(cursor="watch") 
         
         ## Make global the CDM8 emulator
@@ -304,12 +335,24 @@ class CocoIDE(tk.Frame):
         self.file_name = "Untitled"
         self.file_path = None ##??
         self.changed = False
+        ## Project / recent-files management (modern IDE style)
+        self.projectPath = None       # currently open project folder (abs path)
+        self.recentProjects = []      # most recent first
+        self.openedFiles = []         # abs paths of files opened this session
+        self.configDir = os.path.join(USERDIR, ".cocoide")
+        self.configFile = os.path.join(self.configDir, "config.json")
+        self.startupFolder = None     # last folder used by Open/Save dialogs
         self.labelList=[]
         self.hidden=True
         self.memArray=[]
         self.running=False
         self.prevPC=0
         self.prevSP = 255
+        self._lastSP = None            # previous SP shown (for pulse animation)
+        ## Change-animation state (register/PS "pulse" on step execution)
+        self._lastRegVals = [None]*4   # last shown r0-r3 values
+        self._lastCVZNtxt = None       # last shown PS bit string
+        self._pulseIds = {}            # widget -> pending after() id
         self.bpTagNames = []
         self.runDict = colls.OrderedDict()
         self.cliptext = ""
@@ -337,6 +380,13 @@ class CocoIDE(tk.Frame):
         self.IOPorts = [] 
 
         ## Fonts
+        # macOS-friendly monospace default (Menlo is the system mono font)
+        if platform == "darwin" and not cf.basefont:
+            self.editorFontName = "Menlo"
+        elif platform.startswith("win"):
+            self.editorFontName = "Consolas"
+        else:
+            self.editorFontName = "Courier"
         # Scale text font size to screen size, unless not configured
         if self.winfo_screenwidth() > 1200 and cf.screenScaleMode == False:
             self.textsize=10
@@ -362,7 +412,7 @@ class CocoIDE(tk.Frame):
             self.option_add("*Font", self.defaultfont)
         
         # Save the default fixed font and set to size=self.textsize
-        self.defaulttxtfont = font.Font(font="TkFixedFont")
+        self.defaulttxtfont = font.Font(family=self.editorFontName, size=self.textsize)
         #self.editfont=font.Font(font="TkFixedFont")
         self.defaulttxtfont.configure(size=self.textsize)
         
@@ -394,12 +444,35 @@ class CocoIDE(tk.Frame):
         # File menu, and add it to the menu bar
         self.filemenu = tk.Menu(self.menubar, tearoff=0)
         self.filemenu.add_command(label="New", command=self.file_new, accelerator=comkey+"n")
-        self.filemenu.add_command(label="Open", command=self.file_open, accelerator=comkey+"o")
+        self.filemenu.add_command(label="Open...", command=self.file_open, accelerator=comkey+"o")
+        if platform == "darwin":
+            self.filemenu.add_command(label="Open Folder...", command=self.open_project_dialog,
+                                      accelerator="Command-Shift-O")
+        else:
+            self.filemenu.add_command(label="Open Folder...", command=self.open_project_dialog,
+                                      accelerator="Ctrl+Shift+O")
         self.filemenu.add_command(label="Save", command=self.file_save, accelerator=comkey+"s")
-        self.filemenu.add_command(label="SaveAs", command=self.file_save_as, accelerator=comkey+"S")
+        self.filemenu.add_command(label="Save As...", command=self.file_save_as, accelerator=comkey+"S")
         self.filemenu.add_separator()
+        self.recentMenu = tk.Menu(self.filemenu, tearoff=0)
+        self.filemenu.add_cascade(label="Open Recent", menu=self.recentMenu)
+        self._rebuildRecentMenu()
+        self.filemenu.add_separator()
+        self.filemenu.add_command(label="Close File", command=self.file_close)
         self.filemenu.add_command(label="Quit", command=self.close_window, accelerator=comkey+"q")#self.quit)
         self.menubar.add_cascade(label="File", menu=self.filemenu, accelerator=comkey+"f")
+
+        # Project menu - work with a task folder (assignment directories etc.)
+        self.projmenu = tk.Menu(self.menubar, tearoff=0)
+        self.projmenu.add_command(label="Open Folder as Project...", command=self.open_project_dialog,
+                                  accelerator="Cmd+Shift+O")
+        self.projmenu.add_command(label="New File in Project", command=self.new_file_in_project,
+                                  accelerator="Cmd+Alt+N")
+        self.projmenu.add_command(label="Reveal in Finder", command=self.reveal_project_folder)
+        self.projmenu.add_command(label="Open Terminal Here", command=self.open_terminal_here)
+        self.projmenu.add_separator()
+        self.projmenu.add_command(label="Close Project", command=self.close_project)
+        self.menubar.insert_cascade(1, label="Project", menu=self.projmenu)
         
         # Edit menu
         self.editmenu = tk.Menu(self.menubar, tearoff=0)
@@ -408,6 +481,15 @@ class CocoIDE(tk.Frame):
         self.editmenu.add_command(label="Cut", command=self.cut, accelerator=comkey+"t")
         self.editmenu.add_command(label="Copy", command=self.copy, accelerator=comkey+"c")
         self.editmenu.add_command(label="Paste", command=self.paste, accelerator=comkey+"p")
+        self.editmenu.add_command(label="Select All", command=self.selectall, accelerator=comkey+"a")
+        self.editmenu.add_separator()
+        # Auto-completion toggle (VS Code / PyCharm style suggestions)
+        self.menuEdit = self.editmenu   # kept for compatibility with AC code
+        self.acMenuItem = "Auto-completion   ✔"
+        self.editmenu.add_command(label=self.acMenuItem, command=self.toggleAutocomplete,
+                                  accelerator=comkey+"space")
+        self.editmenu.add_command(label="Trigger Completion", command=self.acTrigger,
+                                  accelerator=comkey+"shift+space")
         self.editmenu.add_separator()
         self.txtmenu = tk.Menu(self.editmenu, tearoff=0)
         self.txtmenu.add_radiobutton(label="V Large", command=lambda: self.changeTextSize(22))
@@ -419,10 +501,12 @@ class CocoIDE(tk.Frame):
         
         # Emulator menu
         self.emumenu = tk.Menu(self.menubar, tearoff=0)
-        self.emumenu.add_command(label="Compile/Reset", command=self.compileText)
-        self.emumenu.add_command(label="Run", command=self.runProg)
-        self.emumenu.add_command(label="Stop", command=self.runProg)
-        self.emumenu.add_command(label="Toggle BP", command=self.toggleBP)
+        self.emumenu.add_command(label="Compile/Reset", command=self.compileText,
+                                 accelerator="Cmd+B")
+        self.emumenu.add_command(label="Run", command=self.runProg, accelerator="Cmd+R")
+        self.emumenu.add_command(label="Step", command=lambda: self.stepOnce())
+        self.emumenu.add_command(label="Toggle BP", command=self.toggleBP, accelerator="Cmd+F9")
+        self.emumenu.add_command(label="Clear Breakpoints", command=self.clearBPs)
         self.emumenu.add_command(label="Save Image", command=self.saveImage)
         self.emumenu.add_command(label="Save Object File", command=self.saveObjFile)
         self.emumenu.add_command(label="Cocol CDM8 Linker", command=self.cocolnk)
@@ -434,6 +518,7 @@ class CocoIDE(tk.Frame):
         # Help Menu
         self.helpmenu = tk.Menu(self.menubar, tearoff=0)
         self.helpmenu.add_command(label="Manual", command=self.helpwin)
+        self.helpmenu.add_command(label="About CocoIDE", command=self.aboutDialog)
         self.menubar.add_cascade(label="Help", menu=self.helpmenu)
         # Display the menu
         self.master.config(menu=self.menubar)
@@ -446,19 +531,25 @@ class CocoIDE(tk.Frame):
         # Editor
         self.editButtons = tk.Frame(buttonBar)
         self.editButtons.pack(side=tk.LEFT, fill=tk.BOTH)
-        self.newButton = tk.Button(self.editButtons, text="New", command=self.file_new)
-        self.newButton.grid(row=0, column=0, rowspan=1, sticky="news")
-        self.openButton = tk.Button(self.editButtons, text="Open", command=self.file_open)
-        self.openButton.grid(row=0, column=1, rowspan=1,sticky="ns")
+        # Modern minimal toolbar: New / Open (files & folders menu) / Save / Save As / Quit.
+        self.newButton = tk.Button(self.editButtons, text="+ New", command=self.file_new)
+        self.newButton.grid(row=0, column=0, rowspan=2, sticky="ns", padx=1)
+        self.openButton = tk.Button(self.editButtons, text="Open...")
+        self.openButton.grid(row=0, column=1, rowspan=2, sticky="ns", padx=1)
+        self.openButton.bind("<Button-1>", self.show_open_menu)
         self.saveButton = tk.Button(self.editButtons, text="Save", command=self.file_save)
-        self.saveButton.grid(row=0, column=2, rowspan=1, sticky="ns")
-        
-        self.saveAsButton = tk.Button(self.editButtons, text="SaveAs", command=self.file_save_as)
-        self.saveAsButton.grid(row=0, column=3, rowspan=1, columnspan=2, sticky="nws")
-        self.exitButton = tk.Button(self.editButtons, text="Quit", height=3, command=self.close_window)
-        self.exitButton.grid(row=0, column=5, rowspan=2, sticky="ns")
-        
-        self.searchBox = tk.Entry(self.editButtons, width=8)
+        self.saveButton.grid(row=0, column=2, rowspan=2, sticky="ns", padx=1)
+        self.saveAsButton = tk.Button(self.editButtons, text="Save As...")
+        self.saveAsButton.grid(row=0, column=3, rowspan=2, sticky="ns", padx=1)
+        self.saveAsButton.bind("<Button-1>", lambda e: self.file_save_as())
+        self.exitButton = tk.Button(self.editButtons, text="Quit", command=self.close_window)
+        self.exitButton.grid(row=0, column=5, rowspan=2, sticky="ns", padx=1)
+
+        self.searchBox = tk.Entry(self.editButtons, width=10, fg="grey")
+        self.searchPlaceholder = "Find..."
+        self.searchBox.insert(0, self.searchPlaceholder)
+        self.searchBox.bind("<FocusIn>", self._searchFocusIn)
+        self.searchBox.bind("<FocusOut>", self._searchFocusOut)
         self.searchBox.bind("<Return>", self.searchText)
         self.searchBox.bind("<Button-3>", self.searchText)
         tk.Button(self.editButtons, text="Search", command=self.searchText).grid(row=1, column=0, sticky="ew")
@@ -543,8 +634,25 @@ class CocoIDE(tk.Frame):
             #    width=25, fg="red", padx=6)#, wrap=tk.WORD)width=25,
             #self.amesStatus.grid(row=0, column=2, rowspan=2, sticky="w")
         
+        ## Status bar (below the main panel): cursor position, file type, project
+        self.statusbar = tk.Frame(self, name="statusbar", bg="#e8e8e8", height=22)
+        self.statusbar.grid(row=2, column=0, sticky="ew")
+        self.statusbar.grid_propagate(False)
+        self.cursorLabel = tk.Label(self.statusbar, text="Ln 1, Col 1", anchor="w",
+                                    bg="#e8e8e8", font=self.smallfont, padx=6)
+        self.cursorLabel.pack(side=tk.RIGHT)
+        self.fileKindLabel = tk.Label(self.statusbar, text="CDM8 Assembly", anchor="e",
+                                      bg="#e8e8e8", font=self.smallfont, padx=6)
+        self.fileKindLabel.pack(side=tk.RIGHT)
+        self.projStatusLabel = tk.Label(self.statusbar, text="No folder", anchor="w",
+                                        bg="#e8e8e8", font=self.smallfont, padx=6)
+        self.projStatusLabel.pack(side=tk.LEFT)
+        # NOTE: asstxt is created later in this __init__ (main panel section);
+        # the CaretMove bindings are attached there, not here.
+
         ### Create mainPanel under buttonBAr
         mainPanel = tk.Frame(self, name='cocoidewin')#, bg="yellow")
+        self.mainPanel = mainPanel
         mainPanel.grid(row=1,column=0, sticky="nsew")
         mainPanel.rowconfigure(0, weight=1)     # Allow text and mcode windows to scale vertically
         mainPanel.columnconfigure(1, weight=1)  # Allow text and watch windows to scale horizontally
@@ -574,6 +682,11 @@ class CocoIDE(tk.Frame):
         txtHscroll.grid(row=1, column=0,columnspan=2, sticky="ew")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
         
+        # Status-bar cursor position updates (asstxt exists only from here on)
+        self.asstxt.bind("<<CaretMove>>", self._updateStatusCursor, add=True)
+        self.asstxt.bind("<ButtonRelease-1>", self._updateStatusCursor)
+        self.asstxt.bind("<KeyRelease>", self._updateStatusCursor, add=True)
+
         # Editor - other configurations
         self.asstxt.edit_separator()
         #print("**\n",self.asstxt.bindtags())#debug
@@ -597,6 +710,39 @@ class CocoIDE(tk.Frame):
         ## Bind editor keys
         self.bindKeys()
 
+        # Modern editor niceties: current-line highlight & mouse wheel scrolling
+        self.asstxt.config(insertbackground="red")
+        self.asstxt.tag_configure("currentline", background="#f0f0f0")
+        self.asstxt.bind("<<CaretMove>>", self._markCurrentLine)
+        self._bindMouseWheel(self.asstxt)
+        self._bindMouseWheel(self.mcode_list)
+        # (watchList is created later in this __init__; wheel-bound there)
+
+        # Autocomplete popup state (modern IDE style inline suggestions)
+        self.acListbox = None      # tk.Listbox popup, created on demand
+        self.acWordStart = None    # text index where the completed word begins
+        self.acPrefix = ""         # prefix typed so far
+        self.acWords = []          # current candidate list
+        self.acAfterId = None      # id of the debounced KeyRelease handler
+        self.acIgnored = False     # True while we modify the buffer ourselves
+        self.acEnabled = True      # toggled via Edit menu / config (restored in loadConfig)
+
+        # Autocomplete key wiring: navigation/accept keys are handled by _acKeyFilter
+        # (<Key> binding added further below); Tab is intercepted first so that it
+        # accepts a suggestion when the popup is visible and indents otherwise.
+        self.asstxt.bind("<Tab>", self._acTabHandler, add="+")
+        self.asstxt.bind("<Return>", lambda e: self.acAccept(), add="+")
+        if platform == "darwin":
+            self.bind_all("<Command-space>", self.acTrigger)
+            self.bind_all("<Command-Space>", self.acTrigger)
+            self.bind_all("<Command-Shift-space>", self.acTrigger)
+            self.bind_all("<Command-Shift-Space>", self.acTrigger)
+        else:
+            self.bind_all("<Control-space>", self.acTrigger)
+            self.bind_all("<Control-Space>", self.acTrigger)
+            self.bind_all("<Control-Shift-space>", self.acTrigger)
+        self.asstxt.bind("<FocusOut>", lambda e: self.acHide())
+
 
         ## Bind mcode keys
         self.mcode_list.bind("<Control-T>", self.toggleBP)
@@ -606,9 +752,12 @@ class CocoIDE(tk.Frame):
         self.mcode_list.bind("<Command-t>", self.toggleBP)
 
 
-        # Bind keys for highlighting
-        self.asstxt.bind("<Key>", self.keydisable)
-        self.asstxt.bind('<KeyRelease>', self.highlighter)
+        # Bind keys for highlighting (autocomplete hooks are appended to the same
+        # <Key>/<KeyRelease> sequences so both run on every keystroke)
+        self.asstxt.bind("<Key>", self.keydisable, add="+")
+        self.asstxt.bind("<Key>", self._acKeyFilter, add="+")
+        self.asstxt.bind('<KeyRelease>', self.highlighter, add="+")
+        self.asstxt.bind('<KeyRelease>', self.acSchedule, add="+")
 
         ## Bind mouse events
         
@@ -660,6 +809,7 @@ class CocoIDE(tk.Frame):
         self.watchList.bind("<Double-Button-2>", lambda e: "break")
         self.watchList.bind("<Triple-Button-2>", lambda e: "break")
         self.watchList.bind("<Triple-ButtonRelease-2>", lambda e: "break")
+        self._bindMouseWheel(self.watchList)   # wheel-scrolling, now that it exists
         
         
         self.mcode_list.bind("<Double-ButtonRelease-2>", lambda e: "break")
@@ -678,6 +828,8 @@ class CocoIDE(tk.Frame):
         self.pcLab.grid(row=1, column=0, sticky="w")#, columnspan=2)
         self.pcLabVal = tk.Label(self.regPanel, text="00",width=6, bg=cf.PCcolour, relief="sunken", padx=3, font=self.defaulttxtfont)
         self.pcLabVal.grid(row=2, column=0, sticky="w")
+        self.pcLabVal.bind("<Enter>", lambda e: self._showTip(self.pcLabVal, self.tipPC))
+        self.pcLabVal.bind("<Leave>", self._hideTip)
 
         # PS register (CVZN etc.)
         
@@ -685,12 +837,19 @@ class CocoIDE(tk.Frame):
         self.CVZN_Lab.grid(row=1, column=1, columnspan=2)#,sticky="e")#, columnspan=2)
         self.CVZN_Val = tk.Label(self.regPanel, text="0 000 0000", bg="white", width=15, relief="sunken", font=self.defaulttxtfont)
         self.CVZN_Val.grid(row=2, column=1, columnspan=2)#, sticky="e")#, columnspan=2)
+        # macOS-style tooltips: live decode of the PS (status) register bits
+        self.CVZN_Lab.bind("<Enter>", lambda e: self._showTip(self.CVZN_Lab, self.tipPS))
+        self.CVZN_Lab.bind("<Leave>", self._hideTip)
+        self.CVZN_Val.bind("<Enter>", lambda e: self._showTip(self.CVZN_Val, self.tipPS))
+        self.CVZN_Val.bind("<Leave>", self._hideTip)
 
         # Stack Pointer
         self.spLab = tk.Label(self.regPanel, text=" SP  ",width=7, font=self.boldfont)
         self.spLab.grid(row=1, column=3)#, columnspan=2)
         self.spVal = tk.Label(self.regPanel, text="00", bg=cf.SPcolour, width=7, relief="sunken", font=self.defaulttxtfont)
         self.spVal.grid(row=2, column=3)#, columnspan=2)
+        self.spVal.bind("<Enter>", lambda e: self._showTip(self.spVal, self.tipSP))
+        self.spVal.bind("<Leave>", self._hideTip)
 
 
         spacer1= tk.Label(self.regPanel, text="")#, height=1)
@@ -704,6 +863,8 @@ class CocoIDE(tk.Frame):
         for index in range(4):
             self.regLabs[index] = tk.Label(self.regPanel, text="r"+str(index), width=8, padx=5, fg="blue", font=self.boldfont)
             self.regLabs[index].grid(row=4, column=index, sticky="n")
+            self.regLabs[index].bind("<Enter>", lambda e, i=index: self._showTip(self.regLabs[i], lambda: self.tipReg(i)))
+            self.regLabs[index].bind("<Leave>", self._hideTip)
             self.regHexs[index] = tk.Label(self.regPanel, text="0x00", width=8, bg="white", relief="sunken",font=self.defaulttxtfont)
             self.regHexs[index].grid(row=5, column=index, sticky="n")
             self.regStrs[index] = tk.Label(self.regPanel, text="NUL", width=8, bg="white", relief="sunken",font=self.defaulttxtfont)
@@ -838,13 +999,36 @@ class CocoIDE(tk.Frame):
         self.IOcanvas.bind("<Enter>", _bind_mouse)
         self.IOcanvas.bind("<Leave>", _unbind_mouse)
         
-        ### Finally load file if filename provided from commmand line
+        ### Finally load file if filename provided from command line
+        self.loadConfig()
+        # Build the autocomplete dictionary (mnemonics, directives, macros, registers)
+        self._acBuildDict()
+        self.toggleAutocomplete(refreshOnly=True)   # sync Edit menu with saved setting
         if filename:
             try:
                 self.file_open(filepath=filename)
             except:
                 print("File not found!")
                 exit()
+        if self.savedWindowGeom:
+            try:
+                self.master.geometry(self.savedWindowGeom)
+            except tk.TclError:
+                self.master.geometry("1200x700")
+        else:
+            self.master.geometry("1200x700")
+
+        # Build the project file browser sidebar (VS Code style Explorer)
+        self._buildProjectBrowser()
+        # Reopen last session's project (if it still exists)
+        if self.projectPath and os.path.isdir(self.projectPath):
+            self.set_project(self.projectPath, startup=True)
+        elif self.recentProjects:
+            for p in self.recentProjects:
+                if os.path.isdir(p):
+                    self.set_project(p, startup=True)
+                    break
+
         self.master.config(cursor="")
 
     
@@ -1134,32 +1318,75 @@ class CocoIDE(tk.Frame):
         self.asstxt.bind("<Control-s>", self.file_save)
         self.asstxt.bind("<Control-S>", self.file_save_as)
         
-        self.asstxt.bind("<Control-a>", self.file_save_as)
+        self.asstxt.bind("<Control-a>", self.selectall)
         self.asstxt.bind("<Control-q>", self.file_quit)
         self.asstxt.bind("<Control-Q>", self.file_quit)
         self.asstxt.bind("<Control-Y>", self.redo)
         self.asstxt.bind("<Control-y>", self.redo)
         self.asstxt.bind("<Control-Z>", self.undo)
         self.asstxt.bind("<Control-z>", self.undo)
-        self.asstxt.bind("<Control-c>", self.copy)
-        self.asstxt.bind("<Control-C>", self.copy)
-        self.asstxt.bind("<Control-t>", self.cut)
-        self.asstxt.bind("<Control-T>", self.cut)
-        self.asstxt.bind("<Control-v>", self.paste)
-        self.asstxt.bind("<Control-V>", self.paste)
+        if platform != "darwin":
+            # On macOS plain Control bindings clash with Cmd ones (Tk maps
+            # Command->Control there); real Cmd bindings are added below.
+            self.asstxt.bind("<Control-c>", self.copy)
+            self.asstxt.bind("<Control-C>", self.copy)
+            self.asstxt.bind("<Control-t>", self.cut)
+            self.asstxt.bind("<Control-T>", self.cut)
+            self.asstxt.bind("<Control-v>", self.paste)
+            self.asstxt.bind("<Control-V>", self.paste)
         
         self.asstxt.bind("<Tab>", lambda e: self.tabBlock(shift=1))
-        self.asstxt.bind("<Control-Tab>", lambda e: self.tabBlock(shift=-1)) 
+        self.asstxt.bind("<Shift-Tab>", lambda e: self.tabBlock(shift=-1))
+        self.asstxt.bind("<Control-ISO_Left_Tab>", lambda e: self.tabBlock(shift=-1))
+        self.asstxt.bind("<Control-Tab>", lambda e: self.tabBlock(shift=-1))
+        if platform == "darwin":
+            self.asstxt.bind("<Command-BracketLeft>", lambda e: self.tabBlock(shift=-1))
+            self.asstxt.bind("<Command-BracketRight>", lambda e: self.tabBlock(shift=1)) 
         
-        # OSX/MAC os users add cmd key options as well
+        # Compile / Run / Step / Breakpoint shortcuts (both platforms)
+        self.asstxt.bind("<F5>", self.compileRun)
+        self.asstxt.bind("<Control-F5>", lambda e: self.compileText())
+        self.bind_all("<Control-F5>", lambda e: self.compileText())
+        self.bind_all("<Command-b>", lambda e: self.compileText())
+        self.bind_all("<Command-r>", self.runProg)
+        self.bind_all("<Command-B>", lambda e: self.compileText())
+        self.bind_all("<Command-R>", self.runProg)
+        self.bind_all("<Command-f>", self.focusSearchBox)
+        self.bind_all("<Command-F>", self.focusSearchBox)
+        self.bind_all("<Command-g>", self.gotoLineDialog)
+        self.bind_all("<Command-G>", self.gotoLineDialog)
+        self.bind_all("<Command-Shift-O>", lambda e: self.open_project_dialog())
+        self.bind_all("<Command-Alt-n>", lambda e: self.new_file_in_project())
+        self.bind_all("<Command-Alt-N>", lambda e: self.new_file_in_project())
+        self.asstxt.bind("<Escape>", self.clearEditorHighlights)
+
+        # OSX/Mac OS users add cmd key options as well
         if platform == "darwin":
             self.asstxt.bind("<Command-o>", self.file_open)
             self.asstxt.bind("<Command-O>", self.file_open)
-            #self.asstxt.bind("<Command-Shift-S>", self.file_save_as)
             self.asstxt.bind("<Command-S>", self.file_save_as)
             self.asstxt.bind("<Command-s>", self.file_save)
             self.asstxt.bind("<Command-n>", self.file_new)
             self.asstxt.bind("<Command-N>", self.file_new)
+            self.asstxt.bind("<Command-d>", self.copyLineDown)
+            self.asstxt.bind("<Command-D>", self.copyLineDown)
+            self.asstxt.bind("<Command-Delete>", self.deleteLine)
+            self.asstxt.bind("<BackSpace>", self.macBackspace)
+            self.asstxt.bind("<Shift-BackSpace>", self.macBackspace)
+            self.asstxt.bind("<Command-a>", self.selectall)
+            self.asstxt.bind("<Command-A>", self.selectall)
+            self.asstxt.bind("<Command-z>", self.undo)
+            self.asstxt.bind("<Command-Z>", self.redo)
+            self.asstxt.bind("<Command-x>", self.cut)
+            self.asstxt.bind("<Command-X>", self.cut)
+            self.asstxt.bind("<Command-c>", self.copy)
+            self.asstxt.bind("<Command-C>", self.copy)
+            self.asstxt.bind("<Command-v>", self.paste)
+            self.asstxt.bind("<Command-V>", self.paste)
+            self.asstxt.bind("<Command-Right>", self.lineEnd)
+            self.asstxt.bind("<Command-Left>", self.lineStart)
+            self.asstxt.bind("<Command-Up>", lambda e: self.asstxt.yview_moveto(0))
+            self.asstxt.bind("<Command-Down>", lambda e: self.asstxt.yview_moveto(1))
         
     def unbindKeys(self):
         self.asstxt.bind("<Control-N>", None)
@@ -1180,6 +1407,16 @@ class CocoIDE(tk.Frame):
             self.asstxt.bind("<Command-s>", None)
             self.asstxt.bind("<Command-n>", None)
             self.asstxt.bind("<Command-N>", None)
+            self.asstxt.bind("<Command-d>", None)
+            self.asstxt.bind("<Command-D>", None)
+            self.asstxt.bind("<Command-Delete>", None)
+            self.asstxt.bind("<Command-a>", None)
+            self.asstxt.bind("<Command-A>", None)
+            self.asstxt.bind("<Command-z>", None)
+            self.asstxt.bind("<Command-Z>", None)
+            self.asstxt.bind("<Command-x>", None)
+            self.asstxt.bind("<Command-c>", None)
+            self.asstxt.bind("<Command-v>", None)
             
         
     def amesPause(self, event=None):
@@ -1196,6 +1433,12 @@ class CocoIDE(tk.Frame):
     def keydisable(self, event=None):
         # Disable ! and editing keys for lines with #! when running ames
         #print("keydisable",event.keysym, event.keycode, repr(event.char), event.type)# debug
+        if platform == "darwin":
+            try:
+                if self.asstxt.edit_modified():
+                    self.set_title()  # refresh the unsaved-changes dot
+            except Exception:
+                pass
 
         if self.amesRunning and event.keysym not in ["Left", "Right", "Up", "Down",
                         "Home", "End", "Prior", "Next"]:#, "Control_R"]:# Ames backdoor
@@ -1254,8 +1497,145 @@ class CocoIDE(tk.Frame):
         CVZNstr = format(self.Emu.CVZN & 0b00001111,"04b")
         pageStr = format((self.Emu.CVZN & 0b01110000)>>4, "03b")
         intStr = str(self.Emu.CVZN >> 7)
-        self.CVZN_Val.config(text= "    "+intStr+" "+pageStr+"  "+CVZNstr)
+        newtxt = "    "+intStr+" "+pageStr+"  "+CVZNstr
+        if self._lastCVZNtxt is not None and newtxt != self._lastCVZNtxt \
+                and (self.running or self.stepModeActive()):
+            self.pulseWidget(self.CVZN_Val)   # animate PS change during execution
+        self._lastCVZNtxt = newtxt
+        self.CVZN_Val.config(text= newtxt)
         return
+
+    def stepModeActive(self):
+        """True while single-stepping / running in the emulator panels.
+        Any non-zero program counter means the user has executed at least one
+        instruction, so change-pulses are wanted; before first run they are not."""
+        try:
+            return self.Emu.PC != 0
+        except Exception:
+            return False
+
+    #### Change-animation ("pulse") for register/memory cells ------------------
+    _PULSE_STEPS = ["#FFE9A8", "#FFD966", "#FFF3CF"]  # amber flash -> fade back
+
+    def pulseWidget(self, w):
+        """Briefly highlight a label to draw attention to a value change."""
+        try:
+            base = w.cget("bg")
+            if isinstance(base, tuple):      # 3-tuple rgb form
+                base = "#%02x%02x%02x" % base
+        except Exception:
+            return
+        old = self._pulseIds.get(w)
+        if old:
+            try: self.after_cancel(old)
+            except Exception: pass
+        self._pulseSeq(w, 0, base)
+
+    def _pulseSeq(self, w, i, base):
+        try:
+            if not w.winfo_exists():
+                self._pulseIds.pop(w, None); return
+            if i < len(self._PULSE_STEPS):
+                w.config(bg=self._PULSE_STEPS[i])
+                self._pulseIds[w] = self.after(55, lambda: self._pulseSeq(w, i+1, base))
+            else:
+                w.config(bg=base)
+                self._pulseIds.pop(w, None)
+        except Exception:
+            self._pulseIds.pop(w, None)
+
+    #### Tooltips (macOS-style hover help) -------------------------------------
+    def _showTip(self, widget, textfn, event=None):
+        self._hideTip()
+        try:
+            txt = textfn() if callable(textfn) else textfn
+        except Exception:
+            return
+        if not txt:
+            return
+        tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        try: tw.attributes("-topmost", True)
+        except Exception: pass
+        x = widget.winfo_rootx() + widget.winfo_width() + 6
+        y = widget.winfo_rooty() - 4
+        tw.wm_geometry("+%d+%d" % (x, y))
+        tk.Label(tw, text=txt, justify=tk.LEFT, background="#ffffe0",
+                 relief="solid", borderwidth=1, padx=6, pady=4,
+                 font=self.smallfont if hasattr(self, "smallfont") else None,
+                 wraplength=340).pack(ipadx=1, ipady=1)
+        self._tipWin = tw
+
+    def _hideTip(self, event=None):
+        tw = getattr(self, "_tipWin", None)
+        self._tipWin = None
+        if tw:
+            try: tw.destroy()
+            except Exception: pass
+
+    def tipPS(self):
+        v = self.Emu.CVZN
+        I   = (v >> 7) & 1
+        pg  = (v >> 4) & 0b111
+        C,V,Z,N = [(v >> s) & 1 for s in (3,2,1,0)]
+        lines = [
+            "PS — Processor Status byte:  I ppp CVZN",
+            "",
+            "I    Interrupts enable: %d (%s)" % (I, "allowed" if I else "masked"),
+            "Page Current memory page (bank): p%d" % pg,
+            "C    Carry/borrow: %d" % C,
+            "V    oVerflow (signed): %d" % V,
+            "Z    Zero result: %d" % Z,
+            "N    Negative result (bit7): %d" % N,
+            "",
+            "Branch conditions that read these flags:",
+            "  beq/bne  -> Z      bhs/bls (unsigned) -> C",
+            "  bmi/bpl  -> N      blt/bge/ble/bgt (signed) -> V & N",
+            "  bvs/bvc  -> V      bhi/blo (unsigned) -> C & Z",
+            "",
+            "Raw value: 0x%02X  (%s)" % (v, format(v, "08b")),
+        ]
+        return "\n".join(lines)
+
+    def tipSP(self):
+        spage = self.Emu.curPage if self.Emu.shadowSP else 0
+        val = self.Emu.SP[spage]
+        return ("SP — Stack Pointer (page p%d)\n"
+                "Top of stack at RAM address 0x%02X.\n"
+                "push decrements SP then stores;\npop loads then increments."
+                % (spage, val))
+
+    def tipPC(self):
+        pc = self.Emu.PC
+        try:
+            instr = self.Emu.disassemble(pc) if hasattr(self.Emu, "disassemble") else ""
+        except Exception:
+            instr = ""
+        if not instr:  # fall back to the disasm shown in the Machine-Code panel
+            try:
+                key = "%02X:" % pc
+                ln = self.mcode_list.search(key, "1.0", tk.END, regexp=False)
+                if ln:
+                    line = self.mcode_list.get("%s linestart" % ln[1], "%s lineend" % ln[1])
+                    instr = line.split(":", 1)[-1].strip() if ":" in line else ""
+            except Exception:
+                instr = ""
+        t = "PC — Program Counter\nNext instruction at page p%d, address 0x%02X." % (self.Emu.curPage, pc)
+        if instr:
+            t += "\n\nNext: " + instr.strip()
+        return t
+
+    def tipReg(self, i):
+        r = self.Emu.regs[i]
+        lo, hi = r & 0xFF, (r >> 8) & 0xFF
+        sgn = r - 65536 if r > 32767 else r
+        return ("r%d — 16-bit general register\n"
+                "Value: 0x%04X = %d unsigned, %+d signed\n"
+                "High byte r%dh = 0x%02X ('%s'), low byte r%dl = 0x%02X ('%s')\n\n"
+                "Byte operands usable in instructions:\n"
+                "  r%dh (high), r%dl (low)" ) % (
+                i, r, r, sgn, i, hi, chr(hi) if 32 <= hi < 127 else ".",
+                i, lo, chr(lo) if 32 <= lo < 127 else ".", i, i)
 
     def dispAllMemory(self, page=None):#?? 
         #print("\n\n", "dispAllMemory Call***",len(self.Emu.memory))
@@ -1366,12 +1746,20 @@ class CocoIDE(tk.Frame):
 
     def dispRegs(self):
         for index in range(4):
-            self.regHexs[index].config(text="0x"+self.Emu.hx(self.Emu.regs[index])) # hex row
-            self.regStrs[index].config(text=self.Emu.convert(2,self.Emu.regs[index])) # Char row
+            val = self.Emu.regs[index]
+            # Pulse the whole register column when its value changed during execution
+            if (self._lastRegVals[index] is not None and val != self._lastRegVals[index]
+                    and (self.running or self.stepModeActive())):
+                for w in (self.regHexs[index], self.regStrs[index],
+                          self.regDecs[index], self.regBins[index]):
+                    self.pulseWidget(w)
+            self._lastRegVals[index] = val
+            self.regHexs[index].config(text="0x"+self.Emu.hx(val)) # hex row
+            self.regStrs[index].config(text=self.Emu.convert(2,val)) # Char row
 
-            self.regDecs[index].config(text="%+04d" % int(self.Emu.convert(1,self.Emu.regs[index]))+ " %03d" % self.Emu.regs[index]) # dec row
+            self.regDecs[index].config(text="%+04d" % int(self.Emu.convert(1,val))+ " %03d" % val) # dec row
             #print("*"+convert(1,Regs[k]))# debug
-            self.regBins[index].config(text=format(self.Emu.regs[index],"08b")) # Bin row
+            self.regBins[index].config(text=format(val,"08b")) # Bin row
         return
 
     def dispSP (self):
@@ -1380,7 +1768,13 @@ class CocoIDE(tk.Frame):
         else:
             stackpage = 0
         #print("!",self.Emu.SP)
-        self.spVal.config(text=self.Emu.hx(self.Emu.SP[stackpage]))# ??
+        newSP = self.Emu.SP[stackpage]
+        if getattr(self, "_lastSP", None) == newSP:
+            pass
+        elif self._lastSP is not None and (self.running or self.stepModeActive()):
+            self.pulseWidget(self.spVal)   # animate SP change during execution
+        self._lastSP = newSP
+        self.spVal.config(text=self.Emu.hx(newSP))# ??
         self.memLabel[self.prevSP+self.Emu.datamem[stackpage]*256].config(bg="white")
         if self.Emu.SP[stackpage] != 0: #self.runFrom.get():
             self.memLabel[self.Emu.SP[stackpage]+self.Emu.datamem[stackpage]*256].config(bg=cf.SPcolour)
@@ -1391,57 +1785,50 @@ class CocoIDE(tk.Frame):
         return
 
     def runProg(self, event=None):
-        runAction = self.speedScale.get()
-        #print("runAction= ", runAction)#debug
+        # Non-blocking run loop: keeps the GUI responsive (no macOS "beachball")
+        # and lets Stop/breakpoints interrupt even a fast infinite loop.
         if self.running: # Then stop
-            self.running=False
-            self.Emu.HALT=True
+            self.running = False
+            self.Emu.HALT = True
+            return
+        runAction = self.speedScale.get()
+        self.statusMsg.config(text="")
+        if runAction == 3: # Single step
+            self.stepOnce()
+            return
+        self.running = True
+        self.Emu.HALT = False
+        self._runBatchSteps = 1 if runAction == 2 else 24  # slow / medium / fast
+        self._runDelayMs = 300 if runAction == 2 else 20
+        self.runStopButton.config(text="Stop", fg="red", activeforeground="red")
+        self.speedScale.config(state="disabled")
+        self._runId = self.after(0, self._runLoopStep)
+        return
+
+    def _runLoopStep(self):
+        if not self.running:
+            return
+        n = 0
+        while self.running and not self.Emu.HALT and n < self._runBatchSteps:
+            self.Emu.step(cdm8_io.interrupt, cdm8_io.interruptVector)
+            self.updateOPs()
+            n += 1
+            if self.Emu.PC in self.Emu.BP:
+                self.running = False
+                break
+        self.updateDisp()
+        if self.running and not self.Emu.HALT:
+            self._runId = self.after(self._runDelayMs, self._runLoopStep)
         else:
-            self.statusMsg.config(text="")
-            if runAction == 3: # Step
-                # Step
-                self.Emu.step(cdm8_io.interrupt, cdm8_io.interruptVector)
-                self.updateOPs()
-                self.updateDisp()
-            elif runAction == 2: # Slow run
-                self.runStopButton.config(text="Stop", fg="red", activeforeground="red")
-                self.speedScale.config(state="disabled")
-                self.update()
-                # Slow run
-                self.running = True
-                self.Emu.HALT=False
-                #print(self.running, self.Emu.HALT)#debug
-                while self.running and not self.Emu.HALT:
-                    #print(self.running, self.Emu.HALT)#debug
-                    self.Emu.step(cdm8_io.interrupt, cdm8_io.interruptVector)
-                    self.updateOPs()
-                    self.updateDisp()
-                    if self.Emu.PC in self.Emu.BP: break
-                    time.sleep(0.3)
-            else:
-                #Fast run - 
-                self.runStopButton.config(text="Stop", fg="red", activeforeground="red")
-                self.update()
-                self.running = True
-                self.Emu.HALT=False
-                stepcount = 0
-                while self.running and not self.Emu.HALT:
-                    #print(self.Emu.PC, self.running, self.Emu.HALT)# debug
-                    self.Emu.step(cdm8_io.interrupt, cdm8_io.interruptVector)
-                    self.updateOPs()
-                    
-                    if runAction == 1 or (runAction==0 and stepcount>23):
-                        self.updateDisp()
-                        stepcount = 0
-                    else:
-                        stepcount += 1
-                    if self.Emu.PC in self.Emu.BP: break
+            self._runStopped()
+
+    def _runStopped(self):
+        self.running = False
         self.updateOPs()
         self.updateDisp()
-        self.running=False
-        self.runStopButton.config(text="Run ", fg="black", activeforeground="black" )
+        self.runStopButton.config(text="Run ", fg="black", activeforeground="black")
         self.speedScale.config(state="normal")
-        return
+
 
     def changeTextSize(self, textsize=None):#, event=None):
         if textsize:
@@ -1479,7 +1866,10 @@ class CocoIDE(tk.Frame):
         #if event!= None and (event.char == event.keysym or len(event.char)) == 1: #ignore special keys
         #msg = 'Punctuation Key %r (%r)' % (event.keysym, event.char)
         first, last = self.asstxt.yview()
-        self.running=False
+        if self.running:
+            self.running = False
+            self.Emu.HALT = True
+            self._runStopped()
         self.mcode_list.delete(1.0, tk.END)
         self.watchList.delete(1.0, tk.END)
         self.updateLineNos()
@@ -1682,17 +2072,981 @@ class CocoIDE(tk.Frame):
             self.lntext.config(state="disabled")
         return
 
+    #### Project / folder support (modern IDE-style workspace)
+
+    def loadConfig(self):
+        """Load recent projects/files and window geometry from ~/.cocoide/config.json"""
+        self.savedWindowGeom = None
+        try:
+            with open(self.configFile, encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.recentProjects = [p for p in cfg.get("recentProjects", []) if os.path.isdir(p)]
+            self.openedFiles = [p for p in cfg.get("recentFiles", []) if os.path.isfile(p)]
+            self.savedWindowGeom = cfg.get("windowGeom") or None
+            sf = cfg.get("startupFolder")
+            if sf and os.path.isdir(sf):
+                self.startupFolder = sf
+            if not self.projectPath:
+                self.projectPath = cfg.get("project")
+            if "autocomplete" in cfg:
+                self.acEnabled = bool(cfg["autocomplete"])
+        except Exception:
+            pass
+
+    def saveConfig(self):
+        """Persist settings; called on exit and when the project changes."""
+        try:
+            if not os.path.isdir(self.configDir):
+                os.makedirs(self.configDir)
+            geom = ""
+            try:
+                geom = "%dx%d+%d+%d" % (self.master.winfo_width(), self.master.winfo_height(),
+                                        self.master.winfo_x(), self.master.winfo_y())
+            except Exception:
+                pass
+            cfg = {"recentProjects": self.recentProjects[:10],
+                   "recentFiles": self.openedFiles[:15],
+                   "project": self.projectPath or "",
+                   "startupFolder": self.startupFolder or "",
+                   "autocomplete": bool(getattr(self, "acEnabled", True)),
+                   "windowGeom": geom}
+            with open(self.configFile, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=1)
+        except Exception as e:
+            print("Could not save config:", e)
+
+    def _rebuildRecentMenu(self):
+        """Rebuild the File > Open Recent submenu (folders + files)."""
+        m = getattr(self, "recentMenu", None)
+        if m is None:
+            return
+        m.delete(0, tk.END)
+        if self.recentProjects:
+            m.add_command(label="Folders:", state=tk.DISABLED)
+            for p in self.recentProjects[:8]:
+                m.add_command(label=os.path.basename(p) or p,
+                              command=lambda path=p: self.set_project(path))
+            m.add_separator()
+        if self.openedFiles:
+            m.add_command(label="Files:", state=tk.DISABLED)
+            for fp in self.openedFiles[:10]:
+                name = os.path.basename(fp)
+                parent = os.path.basename(os.path.dirname(fp))
+                m.add_command(label="%s  (%s)" % (name, parent),
+                              command=lambda path=fp: self.file_open(filepath=path))
+        if not self.recentProjects and not self.openedFiles:
+            m.add_command(label="(no recent items)", state=tk.DISABLED)
+        m.add_separator()
+        m.add_command(label="Clear List", command=self._clearRecent)
+
+    def _clearRecent(self):
+        self.recentProjects = []
+        self.openedFiles = []
+        self._rebuildRecentMenu()
+        self.saveConfig()
+
+    def show_open_menu(self, event=None):
+        """Toolbar 'Open...' button: choose between a file and a project folder."""
+        menu = tk.Menu(self.master, tearoff=0)
+        menu.add_command(label="Open File...", command=self.file_open)
+        menu.add_command(label="Open Folder as Project...", command=self.open_project_dialog)
+        menu.add_separator()
+        for p in self.recentProjects[:6]:
+            menu.add_command(label="  " + os.path.basename(p),
+                             command=lambda path=p: self.set_project(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def open_project_dialog(self, event=None):
+        folder = filedialog.askdirectory(title="Select Project Folder",
+                                         initialdir=self.startupFolder or self.homeDir)
+        if folder:
+            self.set_project(os.path.abspath(folder))
+        return "break"
+
+    def set_project(self, folder, startup=False):
+        """Set the working project directory and populate the file browser."""
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            messagebox.showerror("Project", "Folder not found:\n" + folder)
+            return
+        self.projectPath = folder
+        self.startupFolder = folder
+        if folder not in self.recentProjects:
+            self.recentProjects.insert(0, folder)
+        self.recentProjects = self.recentProjects[:10]
+        self._populateProjectTree()
+        self._rebuildRecentMenu()
+        self.projmenu.entryconfig("Close Project",
+                                  state=tk.NORMAL if self.projectPath else tk.DISABLED)
+        self.saveConfig()
+        if not startup:
+            self.statusMsg.config(text="Project:\n" + os.path.basename(folder))
+        try:
+            self.projStatusLabel.config(text="Folder: " + folder)
+        except Exception:
+            pass
+        return folder
+
+    def close_project(self, event=None):
+        self.projectPath = None
+        self._populateProjectTree()
+        self.saveConfig()
+        return "break"
+
+    def reveal_project_folder(self, event=None):
+        """Reveal the project folder in Finder (macOS) / Explorer / Finder equivalents."""
+        folder = self.projectPath or self.startupFolder
+        if not folder:
+            self.open_project_dialog()
+            return
+        try:
+            if platform == "darwin":
+                subprocess.Popen(["open", folder])
+            elif platform.startswith("win"):
+                subprocess.Popen(["explorer", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            print("Reveal failed:", e)
+        return "break"
+
+    def open_terminal_here(self, event=None):
+        """Open a Terminal window in the project folder (macOS: Terminal.app)."""
+        folder = self.projectPath or self.startupFolder or self.homeDir
+        try:
+            if platform == "darwin":
+                safe = folder.replace("'", "'\\''")
+                script = ('tell application "Terminal"\nactivate\n'
+                          "do script \"cd '" + safe + "'\"\nend tell")
+                subprocess.Popen(["osascript", "-e", script])
+            elif platform.startswith("win"):
+                subprocess.Popen(["cmd", "/c", "start", "cmd", "/k",
+                                  'cd /d "' + folder + '"'])
+            else:
+                subprocess.Popen(["x-terminal-emulator", "--working-directory=" + folder])
+        except Exception as e:
+            print("Open terminal failed:", e)
+        return "break"
+
+    def new_file_in_project(self, event=None):
+        """Create a new .asm file inside the project folder and open it."""
+        if not self.projectPath:
+            self.open_project_dialog()
+            if not self.projectPath:
+                return "break"
+        filepath = filedialog.asksaveasfilename(title="New File in Project",
+                                                initialdir=self.projectPath,
+                                                defaultextension=cf.fileext,
+                                                initialfile="newProg" + cf.fileext,
+                                                filetypes=(('CDM8 Assembly', '*'+cf.fileext),
+                                                           ('All files', '*.*')))
+        if not filepath:
+            return "break"
+        try:
+            if not os.path.exists(filepath):
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write("; " + os.path.basename(filepath) + "\n")
+        except Exception as e:
+            messagebox.showerror("New File", "Could not create file:\n%s" % e)
+            return "break"
+        self.file_new()
+        self.file_open(filepath=filepath)
+        self._populateProjectTree()
+        return "break"
+
+    def _buildProjectBrowser(self):
+        """Create the collapsible project-file sidebar to the left of the editor."""
+        panel = tk.Frame(self.mainPanel, name="projbrowser", bg="#fafafa",
+                         highlightthickness=1, highlightbackground="#cccccc")
+        header = tk.Frame(panel, bg="#ededed")
+        header.pack(side=tk.TOP, fill=tk.X)
+        self.projToggle = tk.Button(header, text="▾", width=2, relief=tk.FLAT, bd=0,
+                                    command=self.toggleProjectBrowser)
+        self.projToggle.pack(side=tk.LEFT)
+        self.projTitle = tk.Label(header, text="PROJECT", anchor="w", bg="#ededed",
+                                  font=(self.editorFontName, self.textsize, "bold"))
+        self.projTitle.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(header, text="↻", width=2, relief=tk.FLAT, bd=0,
+                  command=self._populateProjectTree).pack(side=tk.RIGHT)
+        tk.Button(header, text="…", width=2, relief=tk.FLAT, bd=0,
+                  command=self.open_project_dialog).pack(side=tk.RIGHT)
+
+        body = tk.Frame(panel, bg="#fafafa")
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.projCanvas = tk.Canvas(body, bg="#fafafa", highlightthickness=0, width=180)
+        vbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self.projCanvas.yview)
+        self.projCanvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.projCanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.projFrame = tk.Frame(self.projCanvas, bg="#fafafa")
+        self.projWin = self.projCanvas.create_window(0, 0, window=self.projFrame, anchor=tk.NW)
+
+        def _conf_inner(event=None):
+            self.projCanvas.configure(scrollregion=(0, 0, self.projFrame.winfo_reqwidth(),
+                                                    self.projFrame.winfo_reqheight()))
+        self.projFrame.bind('<Configure>', _conf_inner)
+
+        def _conf_canvas(event=None):
+            self.projCanvas.itemconfigure(self.projWin, width=max(event.width,
+                                                        self.projFrame.winfo_reqwidth()))
+        self.projCanvas.bind('<Configure>', _conf_canvas)
+        self._bindMouseWheel(self.projCanvas)
+
+        # Insert into the layout as column 0 (editor shifts to column 1 etc.)
+        panel.grid(row=0, column=0, sticky="nsew", rowspan=3)
+        self.mainPanel.grid_columnconfigure(0, minsize=190)
+        self.projPanel = panel
+        self.projVisible = True
+        self.projTreeItems = {}   # dirpath -> (row_index, label_widget)
+        self._populateProjectTree()
+        self.projmenu.entryconfig("Close Project",
+                                  state=tk.NORMAL if self.projectPath else tk.DISABLED)
+
+    def toggleProjectBrowser(self, event=None):
+        if getattr(self, "projVisible", True):
+            self.projCanvas.itemconfigure(self.projWin, state="hidden")
+            self.projFrame.grid_remove()
+            self.mainPanel.grid_columnconfigure(0, minsize=28)
+            self.projToggle.config(text="▸")
+            self.projTitle.config(text="")
+            self.projVisible = False
+        else:
+            self.projCanvas.itemconfigure(self.projWin, state="normal")
+            self.projFrame.grid()
+            self.mainPanel.grid_columnconfigure(0, minsize=190)
+            self.projToggle.config(text="▾")
+            self.projTitle.config(text="PROJECT")
+            self.projVisible = True
+        self._populateProjectTree()
+        return "break"
+
+    def _populateProjectTree(self, event=None):
+        """Fill the sidebar with the project tree: folders then .asm/PDF/doc files."""
+        if not hasattr(self, "projFrame"):
+            return
+        for child in self.projFrame.winfo_children():
+            child.destroy()
+        self.projTreeItems = {}
+        bold = (self.editorFontName, self.textsize, "bold")
+        norm = (self.editorFontName, self.textsize)
+        row = 0
+
+        def addLabel(text, fg="#000000", fontspec=norm, indent=0, command=None, bg="#fafafa"):
+            nonlocal row
+            l = tk.Label(self.projFrame, text=text, anchor="w", justify=tk.LEFT,
+                         fg=fg, font=fontspec, bg=bg, padx=4 + indent*12, cursor="hand2")
+            l.grid(row=row, column=0, sticky="ew")
+            if command:
+                l.bind("<Button-1>", command)
+                l.bind("<Enter>", lambda e, w=l: w.config(fg="#1a5fb4", underline=True))
+                l.bind("<Leave>", lambda e, w=l, c=fg: w.config(fg=c, underline=False))
+            row += 1
+            return l
+
+        if not self.projectPath:
+            addLabel("No folder open", fg="#888888")
+            addLabel('Click "\u2026" to open', fg="#888888")
+            addLabel("a task folder", fg="#888888")
+        else:
+            self.projTitle.config(text=os.path.basename(self.projectPath).upper()[:16] or "PROJECT")
+            addLabel(os.path.basename(self.projectPath) or self.projectPath,
+                     fontspec=bold, fg="#333333")
+            asmFiles, otherFiles, dirs = [], [], []
+            try:
+                entries = sorted(os.listdir(self.projectPath),
+                                 key=lambda s: s.lower())
+            except Exception:
+                entries = []
+            for name in entries:
+                if name.startswith("."):
+                    continue
+                full = os.path.join(self.projectPath, name)
+                if os.path.isdir(full):
+                    dirs.append(name)
+                elif name.lower().endswith(cf.fileext):
+                    asmFiles.append(name)
+                else:
+                    otherFiles.append(name)
+            for name in asmFiles:
+                full = os.path.join(self.projectPath, name)
+                mark = "● " if full == self.file_path else "   "
+                lbl = addLabel(mark+name, fg="#0b6e0b",
+                               command=lambda e, p=full: self.file_open(filepath=p))
+                if full == self.file_path:
+                    lbl.config(font=bold)
+            for name in otherFiles:
+                full = os.path.join(self.projectPath, name)
+                addLabel("   " + name, fg="#5555aa",
+                         command=lambda e, p=full: self.openExternalFile(p))
+            for name in dirs:
+                full = os.path.join(self.projectPath, name)
+                addLabel("  📁 " + name + "/", fontspec=bold, fg="#333333",
+                         command=lambda e, p=full: self.set_project(p))
+        self.projFrame.update_idletasks()
+
+    def openExternalFile(self, filepath):
+        """Open non-asm project files (PDF briefs, READMEs...) with the system viewer."""
+        try:
+            if platform == "darwin":
+                subprocess.Popen(["open", filepath])
+            elif platform.startswith("win"):
+                os.startfile(filepath)
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+        except Exception as e:
+            print("Could not open", filepath, e)
+
+    def _bindMouseWheel(self, widget):
+        """Two-finger scroll on macOS (MouseWheel/delta) and Linux (buttons 4/5)."""
+        def onWheel(event):
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                widget.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                widget.yview_scroll(1, "units")
+            return "break"
+        widget.bind("<MouseWheel>", onWheel)
+        widget.bind("<Button-4>", onWheel)
+        widget.bind("<Button-5>", onWheel)
+
+    #######  Enhanced compiler diagnostics (CDM8)  #######
+    # CDM8 operand categories, straight from cocas.iset:
+    #   bi  = two register operands      e.g. add rA, rB / ld rA, rB
+    #   un  = one register (ldi/ldsa: reg + value)
+    #   br  = branch to a label/number
+    #   zer = no operands                e.g. halt, rts, pushall
+    #   spmove = stack-pointer ops       addsp/setsp <number>
+    _DIAG_FORMS = {
+        "bi":     "rA, rB          (two registers)",
+        "un":     "rA              (one register)",
+        "br":     "label           (a label or number)",
+        "zer":    "(no operands)",
+        "spmove": "<number>        (stack offset)",
+        "osix":   "<n>             (OS call number)",
+    }
+
+    def _diagForm(self, op):
+        """Return the legal operand form of an instruction/macro name."""
+        try:
+            if op in cocas.iset:
+                cat = cocas.iset[op][1]
+                for nm, val in (("bi", 2), ("un", 1), ("zer", 0), ("br", -1),
+                                ("spmove", -2), ("osix", -3)):
+                    if cat == val:
+                        return self._DIAG_FORMS[nm]
+                return None
+        except Exception:
+            pass
+        try:  # macro library?  standard.mlb lines look like:  jmp:  ...
+            mlb = resPath("standard.mlb")
+            import re as _re
+            with open(mlb) as f:
+                for line in f:
+                    m = _re.match(r"^([A-Za-z]\w*):\s*$", line.rstrip())
+                    if m and m.group(1).lower() == op:
+                        return "macro call – see standard.mlb"
+        except Exception:
+            pass
+        return None
+
+    def diagnoseError(self, msg, errLineNo=None):
+        """Produce a concrete hint ('what to do instead') for a terse
+        cocas.py error message. Returns plain text (or None)."""
+        import re as _re
+        low = msg.lower()
+        src = ""
+        if errLineNo:
+            try:
+                src = self.asstxt.get("%d.0" % errLineNo, "%d.end" % errLineNo)
+            except Exception:
+                src = ""
+        stripped = src.lstrip()
+        opcode = stripped.split()[0].rstrip(":,").lower() if stripped else ""
+        if opcode.endswith(":"):
+            opcode = opcode[:-1]
+        hint = None
+
+        if "register expected" in low:
+            form = self._diagForm(opcode)
+            hint = ("'%s' requires register operand(s): %s."
+                    % (opcode or "this instruction",
+                       form or "see the instruction set"))
+            if opcode in ("add", "sub", "and", "or", "xor", "cmp", "addc",
+                          "move", "ld", "st", "ldc"):
+                hint += ("\nThe CDM8 has NO 'add register, constant' form — "
+                         "you cannot combine a register with a number here.")
+                hint += ("\nTo add a constant:  ldi rB, <const>  then  add rA, rB"
+                         "\nExample:  add r0, r1      ✓        add r0, 1      ✗")
+            elif opcode in ("not", "neg", "dec", "inc", "shr", "shla",
+                            "shra", "rol", "push", "pop", "ldi", "ldsa"):
+                if opcode in ("ldi", "ldsa"):
+                    hint += ("\nCorrect forms:  ldi rA, <value>   or   "
+                             "ldsa rA, template.field")
+                else:
+                    hint += ("\nExample:  inc r0      ✓        inc 5      ✗"
+                             "\nFor constants use ldi:  ldi r0, 5")
+
+        elif "comma expected" in low:
+            hint = ("Operands must be separated by a comma:  'op rA, rB'. "
+                    "Spaces alone are not enough.")
+            hint += "\nExample:  add r0 r1 →  add r0, r1"
+
+        elif "invalid opcode" in low:
+            m = _re.search(r"invalid opcode:\s*(\S+)", low)
+            bad = m.group(1) if m else opcode
+            cands = [k for k in cocas.iset if k.startswith(bad[:2])]
+            hint = ("'%s' is not a CDM8 instruction or defined macro." % bad)
+            if cands:
+                hint += " Did you mean: " + ", ".join(sorted(cands)[:8]) + "?"
+            hint += ("\nRemember: load-immediate is 'ldi', jump-to-subroutine "
+                     "is 'jsr', conditional jumps are 'beq/bne/blt/...'.")
+
+        elif "only one operand expected" in low:
+            form = self._diagForm(opcode)
+            hint = ("'%s' takes exactly ONE operand (%s)."
+                    % (opcode or "this instruction",
+                       form or "one register"))
+            if opcode in ("inc", "dec", "not", "neg", "shr", "shla",
+                          "shra", "rol", "push", "pop"):
+                hint += ("\nExample:  inc r0        ✓"
+                         "\nTwo-operand arithmetic uses add/sub/and/or/xor:  "
+                         "add r0, r1")
+
+        elif "label or number expected" in low:
+            hint = ("Branches (beq, bne, br, jsr…) need an existing label or "
+                    "a numeric address.")
+            if opcode:
+                hint += "\nCheck spelling of the label used after '%s'." % opcode
+            hint += "\nLabels end with ':' and must be defined somewhere in the file."
+
+        elif "not found" in low and "label" in low:
+            m = _re.search(r"label (\S+) not found", low)
+            lbl = m.group(1) if m else "?"
+            hint = ("The label '%s' is never defined in this file." % lbl)
+            hint += ("\nAdd a definition such as '%s:' on its own line, "
+                     "or fix the spelling where it is used." % lbl)
+
+        elif "unexpected text" in low:
+            hint = ("Extra text after the operands. A comment must start "
+                    "with '#'.")
+            if src:
+                hint += "\nOffending line:  " + src.strip()
+
+        elif "label or opcode expected" in low:
+            hint = ("The line starts with something the assembler cannot "
+                    "parse. Lines must begin with a label (name:), an "
+                    "instruction, or whitespace.")
+            if src:
+                hint += "\nOffending line:  " + src.strip()
+
+        elif "decimal out of range" in low:
+            hint = ("Byte values must fit in 0…255 (signed −128…127 for "
+                    "arithmetic). Split larger constants across bytes/"
+                    "template fields, or use dc with several values.")
+
+        elif "illegal register number" in low:
+            hint = "Registers are r0–r3 only (plus r0h/r0l/r1h/r1l halves, sp, pc)."
+
+        elif "expect a digit after a $" in low:
+            hint = "'$' introduces a hex literal, e.g. $FF, $0A."
+
+        elif "runaway string" in low:
+            hint = "An opening \" has no matching closing quote on that line."
+
+        elif "unknown escape character" in low:
+            hint = ("Valid escapes inside strings: \\n \\t \\\\ \\\" etc. "
+                    "Check the character after the backslash.")
+
+        elif "numerical address expected" in low:
+            hint = ("'org'/'ds' style directives need a numeric address "
+                    "(e.g. org $80), not a label defined later.")
+
+        elif "data expected" in low:
+            hint = "'dc' needs at least one value:  dc $01,$02  or  dc \"text\""
+
+        elif "does not match definition of macro" in low:
+            hint = ("Wrong number of arguments for this macro call. "
+                    "Open standard.mlb (or your macro definition between "
+                    "macro:/mend:) and count the parameters.")
+
+        elif "illegal separator" in low:
+            hint = "List items in dc/ds must be separated by commas."
+
+        elif "overlapping asect" in low:
+            hint = ("Two sections were placed at overlapping addresses. "
+                    "Move one section's 'asect' address (or shorten the "
+                    "other section) so they don't collide.")
+
+        elif "memory overflow" in low:
+            hint = "A page holds 256 bytes; split code/data across pages ($page=n)."
+
+        elif "negative out of range" in low:
+            hint = "The computed value is negative but must be a positive byte/word."
+
+        elif "reserved by assembler" in low:
+            hint = "You cannot use an instruction mnemonic as a macro/label name."
+
+        elif "template already defined" in low:
+            hint = "Rename the second tplate, or remove the duplicate definition."
+
+        elif "unknown template" in low or "unknown field name" in low:
+            hint = ("Check the 'name.field' reference against the tplate "
+                    "definitions earlier in the file.")
+
+        elif "unassigned macro-variable" in low:
+            hint = "A macro variable was used before being set inside the macro body."
+
+        elif "too many macro expansions" in low:
+            hint = "Likely infinite macro recursion (a macro calling itself)."
+
+        elif "unrecognised architecture" in low:
+            hint = "#$arch= must be 'hv' (Harvard) or 'vn' (Von Neumann)."
+
+        # Generic fallback: show the correct syntax of the instruction
+        if hint is None and opcode and opcode in cocas.iset:
+            form = self._diagForm(opcode)
+            if form:
+                hint = ("Syntax of '%s':  %s %s" % (opcode, opcode, form))
+
+        if hint and src.strip():
+            hint += "\nYour line %s:  %s" % (errLineNo, src.strip())
+        return hint
+    #######  END enhanced diagnostics  #######
+
+    #######  Autocompletion (VS Code / PyCharm style inline suggestions)  #######
+    def _acBuildDict(self):
+        """Collect every CDM8 word that can be completed:
+        - hardware mnemonics & assembler directives (from cocas.iset)
+        - macro-library names (standard.mlb, e.g. tst/clr/jmp/tplate...)
+        - registers r0-r3/r0h-r1l, SP/PC, condition codes, page numbers p0-p7
+        - syntax-highlighter vocabulary (cdm8_asm.highlights)
+        Words are stored with their category for display in the popup."""
+        words = {}
+        # Instruction/directive categories from the assembler itself
+        catnames = {0: "instruction", -1: "branch", -2: "stack op", -3: "osi call",
+                    -4: "directive", -5: "macro", -6: "macro"}
+        try:
+            for w, (_, cat) in cocas.iset.items():
+                words.setdefault(w.lower(), catnames.get(cat, "instruction"))
+        except Exception:
+            pass
+        # Macro library (standard.mlb): lines like '*name/n'
+        try:
+            mlb = resPath("standard.mlb")
+            if not os.path.exists(mlb):
+                mlb = "standard.mlb"
+            with open(mlb, "r") as f:
+                for line in f:
+                    line = line.rstrip()
+                    if line.startswith("*"):
+                        nm = line[1:].split("/")[0].strip()
+                        if nm.isalnum() or "_" in nm:
+                            words.setdefault(nm.lower(), "macro")
+        except Exception:
+            pass
+        # Registers, condition codes, pages etc. from the highlight definitions
+        try:
+            for colour, lst in cf.highlights.items():
+                for w in lst:
+                    words.setdefault(w.lower(), "register" if w.startswith("r") and len(w) <= 4 else "keyword")
+        except Exception:
+            pass
+        for i in range(4):
+            words.setdefault("r%d" % i, "register")
+            words.setdefault("r%dh" % i, "register")
+            words.setdefault("r%dl" % i, "register")
+        words.setdefault("sp", "register")
+        words.setdefault("pc", "register")
+        self.acDict = words
+
+    def _acLineTokens(self):
+        """Return (word_start_index, prefix) for the identifier under the cursor."""
+        idx = self.asstxt.index(tk.INSERT)
+        lineStart = "%s linestart" % idx
+        before = self.asstxt.get(lineStart, idx)
+        # don't complete inside comments
+        cp = before.find(cf.commentprefix)
+        if cp != -1:
+            return None, ""
+        k = len(before)
+        while k > 0 and (before[k-1].isalnum() or before[k-1] == "_"):
+            k -= 1
+        prefix = before[k:]
+        start = "%s.%d" % (idx.split(".")[0], k)
+        return start, prefix
+
+    def _acCandidates(self, prefix):
+        """Ranked completion candidates for a given prefix."""
+        if not prefix:
+            return []
+        p = prefix.lower()
+        dictMatches = sorted([w for w in self.acDict if w.startswith(p)])
+        # prefer shorter/common words first
+        dictMatches.sort(key=lambda w: (len(w), w))
+        # document words (labels/variables defined in this file) as backup matches
+        docWords = set()
+        text = self.asstxt.get("1.0", tk.END).lower()
+        for m in __import__("re").finditer(r"\b[a-z_][a-z0-9_]*\b", text):
+            w = m.group()
+            if w.startswith(p) and w != p:
+                docWords.add(w)
+        extra = [w for w in sorted(docWords) if w not in dictMatches]
+        result = dictMatches[:60] + extra[:20]
+        return result
+
+    def acSchedule(self, event=None):
+        """Debounced KeyRelease handler: refresh the popup shortly after typing."""
+        if getattr(self, "acIgnored", True):
+            return
+        if not getattr(self, "acEnabled", True):
+            self.acHide()
+            return
+        if self.acAfterId:
+            try:
+                self.after_cancel(self.acAfterId)
+            except Exception:
+                pass
+        self.acAfterId = self.after(120, self.acUpdate)
+
+    def acUpdate(self):
+        self.acAfterId = None
+        if not getattr(self, "acEnabled", True):
+            return
+        start, prefix = self._acLineTokens()
+        if start is None or len(prefix) < 1:
+            self.acHide()
+            return
+        cands = self._acCandidates(prefix)
+        # Hide if nothing to offer or the exact word is already typed
+        cands = [c for c in cands if c != prefix.lower()]
+        if not cands:
+            self.acHide()
+            return
+        self.acWordStart = start
+        self.acPrefix = prefix
+        self.acWords = cands
+        self._acShowPopup()
+
+    def _acShowPopup(self):
+        if self.acListbox is None:
+            self.acListbox = tk.Listbox(self, height=8, activestyle="none",
+                                        exportselection=False, relief=tk.RIDGE, bd=1,
+                                        font=self.defaulttxtfont, selectbackground="#1a5fb4",
+                                        selectforeground="white", highlightthickness=1)
+            self.acListbox.bind("<ButtonRelease-1>", self.acSelectClick)
+            self._bindMouseWheel(self.acListbox)
+        lb = self.acListbox
+        lb.delete(0, tk.END)
+        shown = self.acWords[:8]
+        for w in shown:
+            cat = self.acDict.get(w, "")
+            lb.insert(tk.END, "  %-14s %s" % (w, cat))
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(0)
+        lb.activate(0)
+        # position just below the caret
+        try:
+            bbox = self.asstxt.bbox(tk.INSERT)
+        except tk.TclError:
+            bbox = None
+        if bbox:
+            x, y, h, wdt = bbox
+            gx, gy = self.asstxt.winfo_rootx() + x, self.asstxt.winfo_rooty() + y + h
+            lb.config(width=max(16, max(len(s) for s in shown) + 6))
+            lb.place(x=self.winfo_pointerx() - self.winfo_rootx() if False else
+                     gx - self.winfo_rootx(), y=gy - self.winfo_rooty())
+            lb.tkraise()
+            lb.update_idletasks()
+            # flip above if it would run off the bottom of the screen
+            if lb.winfo_rooty() + lb.winfo_height() > self.winfo_screenheight():
+                lb.place(y=gy - self.winfo_rooty() - lb.winfo_height() - h)
+
+    def acIsVisible(self):
+        return self.acListbox is not None and self.acListbox.winfo_exists() \
+               and self.acListbox.winfo_ismapped()
+
+    def acHide(self):
+        if self.acListbox is not None:
+            try:
+                self.acListbox.place_forget()
+            except Exception:
+                pass
+
+    def acMoveSel(self, delta):
+        if not self.acIsVisible():
+            return "break"
+        lb = self.acListbox
+        sel = lb.curselection()
+        cur = sel[0] if sel else 0
+        n = lb.size() - 1
+        cur = max(0, min(n, cur + delta))
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(cur)
+        lb.activate(cur)
+        lb.see(cur)
+        return "break"
+
+    def acAccept(self, event=None):
+        """Insert the highlighted candidate (Tab / Enter)."""
+        if not self.acIsVisible():
+            return None  # let normal Tab/Return behaviour happen
+        lb = self.acListbox
+        sel = lb.curselection()
+        if not sel:
+            self.acHide()
+            return "break"
+        word = self.acWords[sel[0]]
+        start = self.acWordStart
+        end = self.asstxt.index(tk.INSERT)
+        self.acIgnored = True
+        try:
+            self.asstxt.edit_separator()
+            self.asstxt.mark_set("insertBeforeAC", end)
+            self.asstxt.delete(start, end)
+            self.asstxt.insert(start, word)
+            # add separators automatically for ld/st/push-style ops? keep simple:
+            # append ", " only when user explicitly accepts at word boundary? no.
+            self.asstxt.mark_gravity("insertBeforeAC", tk.LEFT)
+        finally:
+            self.acIgnored = False
+        self.acHide()
+        self.highlighter()
+        return "break"
+
+    def acSelectClick(self, event=None):
+        lb = self.acListbox
+        sel = lb.nearest(event.y)
+        lb.selection_clear(0, tk.END)
+        lb.selection_set(sel)
+        self.asstxt.focus_set()
+        self.acAccept()
+        return "break"
+
+    def acCancel(self, event=None):
+        if self.acIsVisible():
+            self.acHide()
+            return "break"
+        return None
+
+    def acTrigger(self, event=None):
+        """Force-open the completion list (Ctrl+Space / Cmd+Space)."""
+        start, prefix = self._acLineTokens()
+        if start is None:
+            return "break"
+        cands = self._acCandidates(prefix) if prefix else list(
+            sorted(self.acDict.keys()))
+        cands = [c for c in cands if c != prefix.lower()]
+        if not cands:
+            return "break"
+        self.acWordStart = start
+        self.acPrefix = prefix
+        self.acWords = cands
+        self._acShowPopup()
+        return "break"
+
+    def _acTabHandler(self, event=None):
+        """<Tab> binding: accept a completion candidate when the popup is
+        open; otherwise fall back to normal Tab behaviour (insert tab)."""
+        if self.acIsVisible():
+            return self.acAccept()
+        # plain tab insertion, keeping undo-separators tidy
+        self.asstxt.insert(tk.INSERT, "\t")
+        return "break"
+
+    def toggleAutocomplete(self, event=None, refreshOnly=False):
+        if not refreshOnly:
+            self.acEnabled = not self.acEnabled
+        if not self.acEnabled:
+            self.acHide()
+        try:
+            self.menuEdit.entryconfig("Auto-completion",
+                                      label=("Auto-completion   ✔" if self.acEnabled
+                                             else "Auto-completion   "))
+        except Exception:
+            pass
+        if not refreshOnly:
+            self.saveConfig()
+
+    def _acKeyFilter(self, event):
+        """Bind on <Key>: intercept navigation/acceptance keys while popup shows."""
+        if not self.acIsVisible():
+            return None
+        ks = event.keysym
+        if ks in ("Up", "Down"):
+            return self.acMoveSel(1 if ks == "Down" else -1)
+        if ks in ("Tab", "ISO_Left_Tab", "Return"):
+            return self.acAccept()
+        if ks == "Escape":
+            return self.acCancel()
+        return None  # typing continues normally; popup updates via KeyRelease
+
+    def _updateStatusCursor(self, event=None):
+        try:
+            idx = self.asstxt.index(tk.INSERT)
+            ln, col = idx.split(".")
+            sel = ""
+            try:
+                nchars = len(self.asstxt.get("sel.first", "sel.last"))
+                if nchars:
+                    sel = " (%d selected)" % nchars
+            except tk.TclError:
+                pass
+            self.cursorLabel.config(text="Ln %s, Col %d%s" % (ln, int(col)+1, sel))
+            if self.projectPath:
+                self.projStatusLabel.config(text="Folder: " + self.projectPath)
+            else:
+                self.projStatusLabel.config(text="No folder open \u2014 use Project > Open Folder\u2026")
+        except Exception:
+            pass
+
+    def _markCurrentLine(self, event=None):
+        try:
+            self.asstxt.tag_remove("currentline", "1.0", tk.END)
+            ln = self.asstxt.index("insert").split(".")[0]
+            self.asstxt.tag_add("currentline", ln + ".0", "%s lineend+1c" % ln)
+        except Exception:
+            pass
+
+    def macBackspace(self, event=None):
+        """On classic Mac keyboards Fn+Delete sends BackSpace - honour word delete w/ Option."""
+        if platform == "darwin" and (event.state & 0x080000):  # Option held
+            return self.deletePrevWord(event)
+        return None  # default Tk behaviour
+
+    def deletePrevWord(self, event=None):
+        try:
+            start = self.asstxt.search(r"(\S+\s*)?\S*$", "insert linestart", "insert",
+                                       index="backwards", regexp=True, stopindex="1.0")
+            if start and start != "insert":
+                self.asstxt.delete(start, "insert")
+        except Exception:
+            pass
+        return "break"
+
+    def copyLineDown(self, event=None):
+        """Duplicate current line below (Cmd+D, like VS Code Shift+Alt+Down)."""
+        ln = int(float(self.asstxt.index("insert linestart")))
+        lineTxt = self.asstxt.get("%d.0" % ln, "%d.0 lineend" % ln)
+        self.asstxt.insert("%d.0 lineend+1c" % ln, "\n" + lineTxt)
+        self.asstxt.mark_set(tk.INSERT, "%d.0" % (ln+1))
+        self.asstxt.see(tk.INSERT)
+        return "break"
+
+    def deleteLine(self, event=None):
+        """Cmd+BackSpace deletes the whole current line."""
+        ln = int(float(self.asstxt.index("insert linestart")))
+        self.asstxt.delete("%d.0" % ln, "%d.0 lineend+1c" % ln)
+        return "break"
+
+    def lineEnd(self, event=None):
+        self.asstxt.mark_set(tk.INSERT, "insert lineend")
+        self.asstxt.see(tk.INSERT)
+        return "break"
+
+    def lineStart(self, event=None):
+        self.asstxt.mark_set(tk.INSERT, "insert linestart")
+        self.asstxt.see(tk.INSERT)
+        return "break"
+
+    def selectall(self, event=None):
+        self.asstxt.tag_add(tk.SEL, "1.0", tk.END)
+        self.asstxt.mark_set(tk.INSERT, "1.0")
+        self.asstxt.see(tk.INSERT)
+        return "break"
+
+    def focusSearchBox(self, event=None):
+        """Cmd+F focuses the toolbar find box and pre-selects its content."""
+        self.searchBox.focus_set()
+        self.searchBox.select_range(0, tk.END)
+        return "break"
+
+    def gotoLineDialog(self, event=None):
+        """Cmd+G: jump-to-line dialog, like modern IDEs."""
+        maxLine = int(float(self.asstxt.index("end-1c")))
+        try:
+            from tkinter import simpledialog
+        except ImportError:
+            simpledialog = None
+        if simpledialog is None:
+            return "break"
+        dlg = simpledialog.askstring("Go to Line", "Line number (1 - %d):" % maxLine,
+                                     parent=self.master)
+        if dlg:
+            try:
+                n = int(dlg)
+                if 1 <= n <= maxLine:
+                    self.asstxt.mark_set(tk.INSERT, "%d.0" % n)
+                    self.asstxt.see("%d.0" % n)
+                    self.highlightLine("%d.0" % n)
+            except ValueError:
+                pass
+        return "break"
+
+    def clearEditorHighlights(self, event=None):
+        self.highlightLine(None)
+        return "break"
+
+    def stepOnce(self):
+        """Single instruction step (CDM8 > Step menu / speed slider)."""
+        if self.running:
+            self.running = False
+            self.Emu.HALT = True
+        self.Emu.step(cdm8_io.interrupt, cdm8_io.interruptVector)
+        self.updateOPs()
+        self.updateDisp()
+        self.runStopButton.config(text="Run ", fg="black", activeforeground="black")
+        return "break"
+
+    def compileRun(self, event=None):
+        """F5: compile then run, like pressing both buttons."""
+        self.compileText()
+        if not self.running:
+            self.runProg()
+        return "break"
+
+    def aboutDialog(self, event=None):
+        messagebox.showinfo("About CocoIDE",
+            self.TITLE + "\n"
+            "CDM8 assembler/IDE/emulator for teaching\n"
+            "Extended fork: project folders, file browser, recent files,\n"
+            "macOS-friendly shortcuts (Cmd+S/O/N/B/R/F/G/D).\n"
+            "Original: (c) M L Walters, Prof A Shafarenko 2016-2018")
+        return "break"
+
     # Editor Popup menu for asstxt widget
     def popmenu(self, event=None):
         menu = tk.Menu(self.master,tearoff=0)
         menu.add_command(label="Cut",command=self.cut)
         menu.add_command(label="Copy",command=self.copy)
         menu.add_command(label="Paste",command=self.paste)
-        menu.add_command(label="Cancel")
+        menu.add_separator()
+        menu.add_command(label="Select All", command=self.selectall)
+        menu.add_command(label="Duplicate Line", command=self.copyLineDown)
+        menu.add_command(label="Delete Line", command=self.deleteLine)
+        menu.add_separator()
+        menu.add_command(label="Toggle Breakpoint", command=self.toggleBPAtCursor)
         menu.post(event.x_root,event.y_root)
         return
 
-    # Mcode listing Popup memeu for mcode_list widget
+    def toggleBPAtCursor(self, event=None):
+        """Toggle a breakpoint on the editor line under the cursor."""
+        try:
+            ln = int(float(self.asstxt.index("insert linestart")))
+            pos = self.mcode_list.search(":", "%d.0" % ln, "%d.0 lineend+1c" % ln)
+            if pos:
+                # emulate clicking that mcode line
+                self.mcode_list.mark_set(tk.INSERT, "%s linestart" % pos)
+                self.toggleBP()
+            else:
+                messagebox.showinfo("Breakpoint", "No compiled code on this line.\n"
+                                    "Use CDM8 > Compile/Reset first.")
+        except Exception:
+            pass
+        return "break"
+
+    # Mcode listing Popup menu for mcode_list widget
     def popmenuBrk(self, event=None):
         menu = tk.Menu(self.master,tearoff=0)
         menu.add_command(label="Toggle Break",command=self.toggleBP())
@@ -1704,6 +3058,11 @@ class CocoIDE(tk.Frame):
         if self.running: # Stop Emulator
             self.running = False
             self.Emu.HALT=True
+        try:
+            if getattr(self, "_runId", None):
+                self.after_cancel(self._runId)
+        except Exception:
+            pass
             
         if self.amesRunning:
             self.amesSubmit()
@@ -1716,6 +3075,7 @@ class CocoIDE(tk.Frame):
             if self.asstxt.edit_modified():
                 if messagebox.askyesno("Quit","Do you want to save the file..."):
                         self.file_save()
+        self.saveConfig()
         self.after(100, self.master.destroy)
         return
 
@@ -1756,7 +3116,16 @@ class CocoIDE(tk.Frame):
         result = self.save_if_modified()
         if result != None: #None => Aborted or Save cancelled, False => Discarded, True = Saved or Not modified
             if filepath == None:
-                filepath = filedialog.askopenfilename(filetypes=(('CDM8 Assembly', '*.asm'), ('All files', '*.*')))
+                filepath = filedialog.askopenfilename(
+                    initialdir=self.projectPath or self.startupFolder or self.homeDir,
+                    filetypes=(('CDM8 Assembly', '*.asm'), ('All files', '*.*')))
+            if filepath:
+                filepath = os.path.abspath(filepath)
+                ext = os.path.splitext(filepath)[1].lower()
+                if ext not in ("", ".asm", ".obj", ".txt", ".s"):
+                    # e.g. task brief PDF/doc - open with system viewer instead
+                    self.openExternalFile(filepath)
+                    return "break"
             fileContents=""
             if filepath != None  and filepath != '':
                 try:
@@ -1783,6 +3152,25 @@ class CocoIDE(tk.Frame):
                     self.changed=True
                     self.highlighter()
                     self.asstxt.see("1.0")
+                    # Track recents & auto-open the containing folder as project
+                    if filepath not in self.openedFiles:
+                        self.openedFiles.insert(0, filepath)
+                    self.openedFiles = self.openedFiles[:15]
+                    folder = os.path.dirname(filepath)
+                    if folder != self.projectPath:
+                        self.set_project(folder)
+                    else:
+                        self._rebuildRecentMenu()
+                        self._populateProjectTree()
+                    self.saveConfig()
+        return "break"
+
+    def file_close(self, event=None):
+        """Close current file (editor becomes an empty Untitled buffer)."""
+        if self.asstxt.edit_modified():
+            if messagebox.askyesno("Close File", "Save changes before closing?"):
+                self.file_save()
+        self.file_new()
         return "break"
 
     def file_save(self, event=None):
@@ -1806,12 +3194,15 @@ class CocoIDE(tk.Frame):
         if ext == ".asm": filetype="CDM8 Assembly"
         if ext == ".obj": filetype = "CDM8 Object File"
         if filepath == None:
+            initdir = self.projectPath or self.startupFolder or self.homeDir
             if self.file_path:
                 self.file_path = str(self.file_path)[:-4]+ext
-                filepath = filedialog.asksaveasfilename(filetypes=((filetype, '*'+ext), ('All files', '*.*')),
-                        defaultextension ="ext", initialfile=self.file_path.split("/")[-1])
+                filepath = filedialog.asksaveasfilename(initialdir=initdir,
+                        filetypes=((filetype, '*'+ext), ('All files', '*.*')),
+                        defaultextension=ext, initialfile=os.path.basename(self.file_path))
             else:
-                filepath = filedialog.asksaveasfilename(filetypes=((filetype, '*'+ext), ('All files', '*.*')),
+                filepath = filedialog.asksaveasfilename(initialdir=initdir,
+                    filetypes=((filetype, '*'+ext), ('All files', '*.*')),
                     defaultextension=ext) #defaultextension='.asm'
         try:
             with open(filepath, 'wb') as f:
@@ -1824,7 +3215,13 @@ class CocoIDE(tk.Frame):
                     # python 2
                     f.write(bytes(text))#, 'UTF-8'))
                 self.asstxt.edit_modified(False)
-                self.file_path = filepath
+                self.file_path = os.path.abspath(filepath)
+                self.startupFolder = os.path.dirname(self.file_path)
+                if self.file_path not in self.openedFiles:
+                    self.openedFiles.insert(0, self.file_path)
+                self.openedFiles = self.openedFiles[:15]
+                self._rebuildRecentMenu()
+                self._populateProjectTree()
                 self.set_title()
                 return "Saved"
         except TypeError:
@@ -1845,9 +3242,17 @@ class CocoIDE(tk.Frame):
             title=titletxt
         elif self.file_path != None:
             title = os.path.basename(self.file_path)
+            try:
+                if self.asstxt.edit_modified():
+                    title = "\u25cf " + title   # VS Code style unsaved marker
+            except Exception:
+                pass
         else:
             title = "Untitled"
-        self.master.title(title + " - " + self.TITLE)
+        proj = ""
+        if self.projectPath:
+            proj = " \u2014 " + os.path.basename(self.projectPath)
+        self.master.title(title + proj + " - " + self.TITLE)
         return
 
     def undo(self, event=None):
@@ -1920,6 +3325,16 @@ class CocoIDE(tk.Frame):
             pass
         return "break"
 
+    def _searchFocusIn(self, event=None):
+        if self.searchBox.get() == getattr(self, "searchPlaceholder", ""):
+            self.searchBox.delete(0, tk.END)
+            self.searchBox.config(fg="black")
+
+    def _searchFocusOut(self, event=None):
+        if not self.searchBox.get():
+            self.searchBox.config(fg="grey")
+            self.searchBox.insert(0, getattr(self, "searchPlaceholder", ""))
+
     def gotoLine(self, event=None):
         #print(type(self.lineBox.get()))# debug
         try:
@@ -1938,11 +3353,18 @@ class CocoIDE(tk.Frame):
     def searchText(self, event=None):
         try:
             searchStr = self.searchBox.get()
+            if searchStr == getattr(self, "searchPlaceholder", ""):
+                return "break"
             if searchStr:
                 if self.prevStr != searchStr:
                     self.startIndex = "1.0"
                 self.prevStr = searchStr
-                self.startIndex = self.asstxt.search(searchStr, self.startIndex, tk.END)
+                try:
+                    self.startIndex = self.asstxt.search(searchStr, self.startIndex, tk.END)
+                except tk.TclError:
+                    # wrapped past the end - restart from top
+                    self.startIndex = "1.0"
+                    self.startIndex = self.asstxt.search(searchStr, self.startIndex, tk.END)
                 endIndex = self.asstxt.index('%s+%dc' % (self.startIndex, (len(searchStr)))) # find end of word
                 #print(self.startIndex)
                 self.highlightLine(self.startIndex, endIndex)
@@ -2029,7 +3451,10 @@ class CocoIDE(tk.Frame):
         #print("save Image")#debug
         self.compileText()
         if filepath == None:
-            filepath = filedialog.asksaveasfilename(filetypes=(('Logisim Memory Image', '*.img'), ('All files', '*.*')), defaultextension =".img") #defaultextension='.txt'
+            filepath = filedialog.asksaveasfilename(
+                initialdir=self.projectPath or self.startupFolder or self.homeDir,
+                filetypes=(('Logisim Memory Image', '*.img'), ('All files', '*.*')),
+                defaultextension =".img") #defaultextension='.txt'
         
         try:
             with open(filepath, 'wb') as f:
@@ -2064,7 +3489,10 @@ class CocoIDE(tk.Frame):
     def compileText(self, event=None):
         #print("Compiling")
         self.changed=False
-        self.running=False
+        if self.running:
+            self.running = False
+            self.Emu.HALT = True
+            self._runStopped()
         self.Emu.curPage = 0
         textList=[]
         errorMsg=None
@@ -2202,6 +3630,27 @@ class CocoIDE(tk.Frame):
         # Show error/warning in mcode window
         if errorMsg:
             #print("*"+errorMsg)#DEBUG
+            # ---- Enhanced diagnostics (CDM8) ------------------------------
+            # Turn terse assembler messages into concrete, actionable ones
+            # and show the offending source line with a caret marker.
+            try:
+                errorMsg = str(errorMsg)
+            except Exception:
+                pass
+            errLineNo = None
+            try:
+                if "On line" in errorMsg:
+                    errLineNo = int(errorMsg[8:errorMsg.find(" ", 8)])
+                elif errorMsg.startswith("Line"):
+                    errLineNo = int(errorMsg.split(":")[0][4:].strip())
+                elif cocas.errLine:
+                    errLineNo = int(cocas.errLine)
+            except Exception:
+                errLineNo = None
+            helpTxt = self.diagnoseError(errorMsg, errLineNo)
+            if helpTxt:
+                errorMsg = errorMsg + "\n\n" + helpTxt
+            # ---- end enhanced diagnostics --------------------------------
             errorMsg = errorMsg.split(" ")
             #print(retError)
             self.mcode_list.delete(1.0, tk.END)
@@ -2361,16 +3810,16 @@ def savefiles():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='CocoIDE V0.92')
-    #parser.add_argument('-p',dest='scrScale',action='store_const',const=True,default=False, help="-p  Presenter mode, expands program window to fill screen")
-    parser.add_argument('filename', nargs='?', help="Option <filename>")
-    #parser.add_argument("--file", "-f", type=str, required=False)
+    parser = argparse.ArgumentParser(description='CocoIDE Extended - CDM8 assembler IDE')
+    parser.add_argument('filename', nargs='?', help="Optional <filename> to open")
+    parser.add_argument("-P", "--project", dest="project", type=str, default=None,
+                        help="Open a folder as project (task directory)")
     args = parser.parse_args()
-    #print(args.scrScale, args.filename)#debug
-    #sys.excepthook = savefiles # If fatal error save files!
-    Emu=cdm8_emu.CDM8Emu()
-    CocoIDE(Emu, filename=args.filename).mainloop()
-    #savefiles()
+    Emu = cdm8_emu.CDM8Emu()
+    app = CocoIDE(Emu, filename=args.filename)
+    if args.project:
+        app.set_project(os.path.abspath(args.project))
+    app.mainloop()
 
 if __name__ == '__main__':
     main()
