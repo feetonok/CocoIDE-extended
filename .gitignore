@@ -1,17 +1,3 @@
-# Virtual Environments
-.venv/
-.venv-build/
-venv/
-
-# Build Artifacts and Distribution
-build/
-dist/
-
-# Python Cache and Compiled Files
+# Compiled/Binary files
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Logs and Temp Files
-*.log
-build_log.txt
+*.pyc

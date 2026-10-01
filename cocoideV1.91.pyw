@@ -96,6 +96,7 @@ try:
     from tkinter import ttk
     from tkinter import filedialog
     from tkinter import messagebox
+    from tkinter import TclError
     import tkinter.font as font
 except:
     # Python 2 tk (runs but not exhaustively tested!)
@@ -103,6 +104,7 @@ except:
     import ttk
     import tkFileDialog as filedialog
     import tkMessageBox as messagebox
+    from Tkinter import TclError
     import tkFont as font
 
 import argparse
@@ -710,6 +712,14 @@ class CocoIDE(tk.Frame):
         ## Bind editor keys
         self.bindKeys()
 
+        # Robustness: some Tk builds (e.g. python.org Python 3.14 + Tk) lack
+        # certain keysyms like BracketLeft/BracketRight -> bind those
+        # block-indent shortcuts safely, never crashing startup over them.
+        try:
+            self._bindBlockIndentShortcuts()
+        except Exception as _e:
+            print("block-indent shortcuts skipped:", _e)
+
         # Modern editor niceties: current-line highlight & mouse wheel scrolling
         self.asstxt.config(insertbackground="red")
         self.asstxt.tag_configure("currentline", background="#f0f0f0")
@@ -732,15 +742,15 @@ class CocoIDE(tk.Frame):
         # accepts a suggestion when the popup is visible and indents otherwise.
         self.asstxt.bind("<Tab>", self._acTabHandler, add="+")
         self.asstxt.bind("<Return>", lambda e: self.acAccept(), add="+")
+        # Autocomplete trigger (VS Code style). Use lowercase 'space' keysym
+        # and _safeBind: some Tk builds (e.g. python.org 3.14) don't know
+        # the capitalized "Space" keysym and would crash startup otherwise.
         if platform == "darwin":
-            self.bind_all("<Command-space>", self.acTrigger)
-            self.bind_all("<Command-Space>", self.acTrigger)
-            self.bind_all("<Command-Shift-space>", self.acTrigger)
-            self.bind_all("<Command-Shift-Space>", self.acTrigger)
+            self._safeBind(self, "<Command-space>", lambda e: self.acTrigger())
+            self._safeBind(self, "<Command-Shift-space>", lambda e: self.acTrigger())
         else:
-            self.bind_all("<Control-space>", self.acTrigger)
-            self.bind_all("<Control-Space>", self.acTrigger)
-            self.bind_all("<Control-Shift-space>", self.acTrigger)
+            self._safeBind(self, "<Control-space>", lambda e: self.acTrigger())
+            self._safeBind(self, "<Control-Shift-space>", lambda e: self.acTrigger())
         self.asstxt.bind("<FocusOut>", lambda e: self.acHide())
 
 
@@ -1339,9 +1349,8 @@ class CocoIDE(tk.Frame):
         self.asstxt.bind("<Shift-Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-ISO_Left_Tab>", lambda e: self.tabBlock(shift=-1))
         self.asstxt.bind("<Control-Tab>", lambda e: self.tabBlock(shift=-1))
-        if platform == "darwin":
-            self.asstxt.bind("<Command-BracketLeft>", lambda e: self.tabBlock(shift=-1))
-            self.asstxt.bind("<Command-BracketRight>", lambda e: self.tabBlock(shift=1)) 
+        # (Cmd+Shift-[ / Cmd+] block-indent shortcuts are attached safely
+        # further below via _safeBind – some Tk builds lack those keysyms.) 
         
         # Compile / Run / Step / Breakpoint shortcuts (both platforms)
         self.asstxt.bind("<F5>", self.compileRun)
@@ -1387,6 +1396,44 @@ class CocoIDE(tk.Frame):
             self.asstxt.bind("<Command-Left>", self.lineStart)
             self.asstxt.bind("<Command-Up>", lambda e: self.asstxt.yview_moveto(0))
             self.asstxt.bind("<Command-Down>", lambda e: self.asstxt.yview_moveto(1))
+
+    def _setMenuLabel(self, menu, match, newlabel):
+        """Change a menu entry's label by substring match (index-independent)."""
+        try:
+            for i in range(menu.index("end")+1):
+                lab = str(menu.entrycget(i, "label"))
+                if match in lab:
+                    menu.entryconfig(i, label=newlabel)
+                    return True
+        except TclError:
+            pass
+        return False
+
+    def _safeBind(self, widget, seq, func):
+        """Bind a shortcut, skipping it if this Tk build lacks the keysym
+        (e.g. BracketLeft/BracketRight are missing in some macOS Tk 8.6/9.x)."""
+        try:
+            widget.bind(seq, func)
+            return True
+        except TclError:
+            return False
+
+    def _bindBlockIndentShortcuts(self):
+        """VS Code-style block indent: Cmd+] / Cmd+Shift+[ (+ Ctrl on Linux/Win)."""
+        combos = [
+            ("<Control-BracketRight>", lambda e: self.tabBlock(shift=1)),
+            ("<Control-Shift-BracketLeft>", lambda e: self.tabBlock(shift=-1)),
+        ]
+        if platform == "darwin":
+            combos += [
+                ("<Command-BracketRight>", lambda e: self.tabBlock(shift=1)),
+                ("<Command-bracketright>", lambda e: self.tabBlock(shift=1)),
+                ("<Command-Shift-BracketLeft>", lambda e: self.tabBlock(shift=-1)),
+                ("<Command-bracketleft>", lambda e: self.tabBlock(shift=1)),
+                ("<Command-Shift-bracketleft>", lambda e: self.tabBlock(shift=-1)),
+            ]
+        for seq, fn in combos:
+            self._safeBind(self.asstxt, seq, fn)
         
     def unbindKeys(self):
         self.asstxt.bind("<Control-N>", None)
@@ -1661,12 +1708,12 @@ class CocoIDE(tk.Frame):
             self.emuNb.add(self.mem_frame[0], text="Page "+str(curPage)+" Memory")
             #self.emuNb.config(0, text=)
             self.emuNb.hide(1)
-            self.emumenu.entryconfig(8, label="Arch. = Harvard   ")
+            self._setMenuLabel(self.emumenu, "Arch.", "Arch. = Harvard   ")
         else:
             numbanks = 2
             self.emuNb.add(self.mem_frame[0], text=("Page "+str(curPage)+" ROM"))
             self.emuNb.add(self.mem_frame[1], text=("Page "+str(curPage)+" RAM"))#, state="normal")#, underline=0, padding=2)
-            self.emumenu.entryconfig(8, label="Arch. = Von Neuman")
+            self._setMenuLabel(self.emumenu, "Arch.", "Arch. = Von Neuman")
             
         for n in range(numbanks): # All banks in in current CDM8 memory page
             #print("Memory page ", curPage, " bank ", n, "=",self.Emu.memory[curPage][n])
@@ -3411,11 +3458,11 @@ class CocoIDE(tk.Frame):
         if self.pageDisp:
             self.memPageFrame.grid_remove()
             self.pageDisp = False
-            self.emumenu.entryconfig(9, label="Paged Memory   ")
+            self._setMenuLabel(self.emumenu, "Paged Memory", "Paged Memory   ")
         else:
             self.memPageFrame.grid()
             self.pageDisp = True
-            self.emumenu.entryconfig(9, label="Paged Memory  ✔")
+            self._setMenuLabel(self.emumenu, "Paged Memory", "Paged Memory  ✔")
     
     
     def toggleArch(self, event=None):
@@ -3427,10 +3474,10 @@ class CocoIDE(tk.Frame):
     def setShadowSP(self, event=None):
         if self.Emu.shadowSP == False:
             # Toggle off shadow SPs
-            self.emumenu.entryconfig(10, label="Shadow SPs      ✔")
+            self._setMenuLabel(self.emumenu, "Shadow SPs", "Shadow SPs      ✔")
             self.Emu.shadowSP = True
         else:
-            self.emumenu.entryconfig(10, label="Shadow SPs       ")
+            self._setMenuLabel(self.emumenu, "Shadow SPs", "Shadow SPs       ")
             self.Emu.shadowSP = False
         
     def setArch(self, arch="vn", page=0, event=None):
