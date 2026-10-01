@@ -905,10 +905,78 @@ class CocoIDE(tk.Frame):
         self.activeTab = 0
         self._tabSwapGuard = False
         self._savedBuffers = {}      # path -> (content, insert-index) while inactive
+        # The tab strip lives ABOVE the editor itself: row -1 of column 1 is
+        # the empty gap left by the line-number gutter (row 0 only), so the
+        # bar sits flush over the text area without shifting any other grid
+        # row (moving it into row 2 would collide with Memory Watches).
         self.editorTabBar = tk.Frame(mainPanel, bg="#e6e6e6", height=25)
-        self.editorTabBar.grid(row=2, column=0, columnspan=3, sticky="ew")
+        self.editorTabBar.grid(row=-1, column=1, sticky="ew")
         self.editorTabBar.grid_propagate(False)
+        self._etbScroll = 0          # horizontal scroll offset for many tabs
+        # Wheel over the strip scrolls through the tab list when it overflows.
+        if platform == "darwin":
+            self.editorTabBar.bind("<MouseWheel>",
+                                   lambda e: self._etbWheel(e.delta))
+        else:
+            self.editorTabBar.bind("<Button-4>", lambda e: self._etbWheel(120))
+            self.editorTabBar.bind("<Button-5>", lambda e: self._etbWheel(-120))
         self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
+
+        # Status/Run time warning/Error pane - a LOG TERMINAL (PyCharm/VS Code
+        # style): multi-line, scrollable, word-wrapped. The old single Label
+        # clipped long compiler messages because it lived inside the fixed
+        # button bar; now the full diagnostic (with every hint line) is here.
+        self.logFrame = tk.Frame(mainPanel, bg="#1e1e1e")
+        # The Machine Code tab area (row 0, col 3) already owns row -1; the
+        # terminal goes to the same row but in column 2 - directly under the
+        # editor, where the old clipped one-line status label used to be.
+        self.logFrame.grid(row=-1, column=2, sticky="nsew")
+        mainPanel.rowconfigure(-1, weight=0, minsize=96)   # fixed-height terminal
+        mainPanel.columnconfigure(2, weight=0, minsize=240)
+        logHead = tk.Label(self.logFrame, text="  OUTPUT", anchor="w",
+                           bg="#2d2d2d", fg="#bbbbbb",
+                           font=(self.editorFontName, self.textsize - 2, "bold"))
+        logHead.pack(side=tk.TOP, fill=tk.X)
+        _logbody = tk.Frame(self.logFrame, bg="#1e1e1e")
+        _logbody.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.logText = tk.Text(_logbody, height=4, wrap=tk.WORD, relief=tk.FLAT, bd=0,
+                               bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                               font=self.smallfont, padx=6, pady=3, takefocus=0,
+                               yscrollcommand=lambda *a: None)
+        _lvbar = ttk.Scrollbar(_logbody, orient=tk.VERTICAL, command=self.logText.yview)
+        self.logText.config(yscrollcommand=_lvbar.set)
+        _lvbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.logText.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for tag, col in (("info", "#9cdcfe"), ("ok", "#6ac97c"),
+                         ("warn", "#e5c07b"), ("error", "#f14c4c")):
+            self.logText.tag_configure(tag, foreground=col)
+        self.logText.bind("<Key>", lambda e: "break")   # read-only
+        self._bindMouseWheel(self.logText)
+        tk.Button(logHead, text="\u2715", bd=0, relief=tk.FLAT, bg="#2d2d2d",
+                  fg="#bbbbbb", activebackground="#3d3d3d", cursor="hand2",
+                  command=lambda: self.logText.delete("1.0", tk.END)).pack(side=tk.RIGHT)
+        # Keep the compact one-line summary label alive (many code paths call
+        # statusMsg.config directly); it now only shows the FIRST line of any
+        # message - the full text goes to the Output log above.
+        class _StatusProxy(object):
+            def __init__(self, real, owner):
+                self._real = real; self._owner = owner
+            def config(self, **kw):
+                txt = kw.get("text")
+                if txt is not None:
+                    first = str(txt).strip().splitlines() or [""]
+                    kw["text"] = first[0][:80]
+                    tail = "\n".join(str(txt).strip().splitlines()[1:])
+                    if tail.strip():
+                        lvl = "error" if ("rror" in first[0] or
+                                          first[0].startswith("***")) else "info"
+                        self._owner.log(lvl, tail)
+                return self._real.config(**kw)
+            def cget(self, k):
+                return self._real.cget(k)
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+        self.statusMsg = _StatusProxy(self.statusMsg, self)
 
         ## Bind editor keys
         self.bindKeys()
@@ -1022,10 +1090,11 @@ class CocoIDE(tk.Frame):
 
         ## Create and add Watch panel
         watchPanel = tk.Frame(mainPanel, name="watchpanel")#, bg="blue")#,  height=80)#,  background="red") #width=570,
-        # start at column 1 so the PROJECT sidebar (column 0) never covers
-        # the Memory Watches list - previously this spanned from column 0 and
-        # the watches were hidden behind the file tree.
-        watchPanel.grid(row=2, column=1, columnspan=2, sticky="nsew")
+        # Bottom strip sits between the editor column (1) and the Registers
+        # column (3): the PROJECT sidebar owns the full-height column 0 now,
+        # so the watches start at column 1 - no overlap with the tree, and no
+        # empty square left under it.
+        watchPanel.grid(row=2, column=1, columnspan=1, sticky="nsew")
         watchPanel.columnconfigure(0, weight=1)
         #watchPanel.columnconfigure(1, weight=1) 
         # And contents
@@ -2761,10 +2830,11 @@ class CocoIDE(tk.Frame):
         self._bindMouseWheel(self.projCanvas)
 
         # Insert into the layout as column 0 (editor shifts to column 1 etc.).
-        # IMPORTANT: only span rows 0-1 (editor + machine code). Row 2 holds the
-        # Memory Watches panel; if the sidebar spanned it too, its 190px column
-        # would cover the watches and they could never be seen/scrolled.
-        panel.grid(row=0, column=0, sticky="nsew", rowspan=2)
+        # The sidebar spans the FULL height of the main panel: its old bottom
+        # neighbour (the Memory Watches block) was moved next to the editor, so
+        # there is no row-2 gap left below it - previously that gap showed up
+        # as an ugly empty square under the tree.
+        panel.grid(row=0, column=0, sticky="nsew", rowspan=5)
         self.mainPanel.grid_columnconfigure(0, minsize=190)
         # NOTE: do NOT add weight to the sidebar column. The editor column keeps
         # weight=1, so resizing the window never "jitters" the whole layout.
@@ -2964,6 +3034,10 @@ class CocoIDE(tk.Frame):
                      tip=lambda: root + "\nClick: open another folder\n" \
                                        "Right-click: menu")
             self._addTreeLevel(root, 0, bold, norm, addLabel)
+        # The tree rows live in a Canvas window that defaults to width 0 -
+        # without an explicit column stretch every row keeps its tiny natural
+        # width and the right-click/hover targets become nearly unclickable.
+        self.projFrame.grid_columnconfigure(0, weight=1, uniform="projrow")
         self.projFrame.update_idletasks()
         try:
             self.projCanvas.yview_moveto(first)
@@ -3041,6 +3115,23 @@ class CocoIDE(tk.Frame):
             print("Could not open", filepath, e)
 
     #### Bottom tab strip (Machine Code + opened files)  ##################
+
+    def log(self, level, text):
+        """Append a line to the Output terminal (thread-safe via after())."""
+        if not hasattr(self, "logText") or not self.logText.winfo_exists():
+            return
+        tag = {"info": "info", "ok": "ok", "warn": "warn",
+               "error": "error"}.get(level, "info")
+        try:
+            for ln in str(text).rstrip().splitlines() or [""]:
+                self.logText.insert(tk.END, ln + "\n", tag)
+            # keep the log bounded (long debug sessions must not eat memory)
+            lines = int(self.logText.index("end-1c").split(".")[0])
+            if lines > 800:
+                self.logText.delete("1.0", "%d.0" % (lines - 600))
+            self.logText.see(tk.END)
+        except Exception:
+            pass
 
     def _rebuildMcodeTabBar(self):
         """Redraw the small tab bar above the Machine Code panel."""
@@ -3160,7 +3251,45 @@ class CocoIDE(tk.Frame):
             w.destroy()
         boldf = getattr(self, "boldfont", None) or ("TkDefaultFont", 10, "bold")
         normf = getattr(self, "smallfont", None) or ("TkDefaultFont", 10)
-        for i, tab in enumerate(self.editorTabs):
+        # Scrolling strip: when the tabs don't fit, show ◀ ▶ arrows and render
+        # only the window of tabs that fits (VS Code behaviour).
+        try:
+            avail = max(120, self.editorTabBar.winfo_width())
+        except Exception:
+            avail = 400
+        approx = lambda t: 30 + 8 * len(t)      # rough tab width incl. close btn
+        need = sum(approx(("● " if t["dirty"] else "") + t["name"])
+                   for t in self.editorTabs)
+        overflow = need > avail - 8
+        start = 0
+        if overflow:
+            tk.Button(self.editorTabBar, text="\u25C0", bd=0, relief=tk.FLAT,
+                      highlightthickness=0, bg="#dcdcdc", fg="#444444",
+                      activebackground="#c8c8c8", padx=4, cursor="hand2",
+                      command=lambda: self._etbScrollBy(-1)).pack(side=tk.LEFT, fill=tk.Y)
+            tk.Button(self.editorTabBar, text="\u25B6", bd=0, relief=tk.FLAT,
+                      highlightthickness=0, bg="#dcdcdc", fg="#444444",
+                      activebackground="#c8c8c8", padx=4, cursor="hand2",
+                      command=lambda: self._etbScrollBy(+1)).pack(side=tk.LEFT, fill=tk.Y)
+            budget = avail - 60
+            # keep the ACTIVE tab inside the visible window
+            self._etbScroll = min(max(0, self._etbScroll),
+                                  max(0, len(self.editorTabs) - 1))
+            while self.activeTab < self._etbScroll:
+                self._etbScroll -= 1
+            cum = 0; start = self._etbScroll
+            for i in range(start, len(self.editorTabs)):
+                cw = approx(self.editorTabs[i]["name"])
+                if cum + cw > budget and i != self.activeTab:
+                    break
+                cum += cw
+            end = i + (1 if cum <= budget or i == self.activeTab else 0)
+            indices = range(start, min(end, len(self.editorTabs)))
+        else:
+            self._etbScroll = 0
+            indices = range(len(self.editorTabs))
+        for i in indices:
+            tab = self.editorTabs[i]
             active = (i == self.activeTab)
             name = ("\u25cf " if tab["dirty"] else "") + tab["name"]
             cell = tk.Frame(self.editorTabBar,
@@ -3177,6 +3306,18 @@ class CocoIDE(tk.Frame):
             x.pack(side=tk.LEFT)
             x.bind("<Button-1>", lambda e, k=i: self.closeTab(k))
         tk.Frame(self.editorTabBar, bg="#e6e6e6").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _etbScrollBy(self, delta):
+        self._etbScroll = max(0, min(len(self.editorTabs) - 1,
+                                     self._etbScroll + delta * 3))
+        self._rebuildEditorTabBar()
+
+    def _etbWheel(self, delta):
+        # Horizontal tab-strip scrolling via mouse wheel (macOS sends deltas of
+        # +/-1..+/-10; X11 Button-4/5 mapped to +/-120 above).
+        step = 1 if int(delta) > 0 else -1
+        self._etbScrollBy(-step)
+        return "break"
 
     def _storeActiveBuffer(self):
         """Snapshot current editor content into its tab record."""
@@ -5145,6 +5286,21 @@ def savefiles():
 
 
 
+def _crashLog(exc):
+    """Append a traceback to ~/.cocoide/crash.log. Frozen Finder-launched apps
+    have no console, so without this a startup failure looks like the app
+    'flashing and vanishing' with zero diagnostics."""
+    import traceback, datetime
+    try:
+        d = os.path.expanduser("~/.cocoide")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
+            f.write("\n[%s] %s\n" % (datetime.datetime.now(), repr(exc)))
+            f.write(traceback.format_exc())
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description='CocoIDE Extended - CDM8 assembler IDE')
     parser.add_argument('filename', nargs='?', help="Optional <filename> to open")
@@ -5160,7 +5316,11 @@ def main():
         except Exception:
             pass
     Emu = cdm8_emu.CDM8Emu()
-    app = CocoIDE(Emu, filename=args.filename)
+    try:
+        app = CocoIDE(Emu, filename=args.filename)
+    except Exception as e:
+        _crashLog(e)
+        raise
     tk._cocoide_root = app          # used by the native About menu handler
     if args.project:
         app.set_project(os.path.abspath(args.project))
@@ -5169,6 +5329,10 @@ def main():
         # application identity: Dock icon, menu-bar name, bring-to-front.
         app.after(150, _macActivate)
         app.after(300, _macInstallAppMenu)
+    # Any exception raised inside an event callback would otherwise print to an
+    # invisible console (frozen app) and leave the UI half-broken; log it and
+    # keep running like modern IDEs do.
+    app.report_callback_exception = lambda *a: _crashLog(a[1])
     app.mainloop()
 
 if __name__ == '__main__':
