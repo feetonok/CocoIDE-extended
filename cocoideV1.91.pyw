@@ -182,7 +182,24 @@ def resPath(name):
                     return p
     return os.path.join(appDir(), name)
 
-USERDIR = appDir() if _isFrozen() else os.path.expanduser("~")
+# NOTE: user settings/config always live in ~/.cocoide - even for a frozen
+# .app bundle. The bundle directory (…/CocoIDE.app/Contents/MacOS) is awkward
+# to browse and gets wiped on every rebuild, so it must NOT hold the config.
+USERDIR = os.path.expanduser("~")
+
+
+def _diagLog(text):
+    """Append one line to ~/.cocoide/startup.log. A frozen Finder-launched .app
+    has no console at all, so without this a silent 'flash and quit' crash is
+    impossible to diagnose. Every step of startup reports through here."""
+    import datetime
+    try:
+        d = os.path.expanduser("~/.cocoide")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "startup.log"), "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (datetime.datetime.now().isoformat(timespec="seconds"), text))
+    except Exception:
+        pass
 
 def _macActivate():
     """Bring CocoIDE to the front on macOS and give it a proper application
@@ -616,13 +633,11 @@ class CocoIDE(tk.Frame):
         self.editmenu.add_command(label="Paste", command=self.paste, accelerator=comkey+"p")
         self.editmenu.add_command(label="Select All", command=self.selectall, accelerator=comkey+"a")
         self.editmenu.add_separator()
-        # Auto-completion toggle (VS Code / PyCharm style suggestions)
+        # Auto-completion popup removed by user request (it slowed typing
+        # down).  The menu no longer offers it; the underlying code stays
+        # dormant with acEnabled forced to False.
         self.menuEdit = self.editmenu   # kept for compatibility with AC code
-        self.acMenuItem = "Auto-completion   ✔"
-        self.editmenu.add_command(label=self.acMenuItem, command=self.toggleAutocomplete,
-                                  accelerator=comkey+"space")
-        self.editmenu.add_command(label="Trigger Completion", command=self.acTrigger,
-                                  accelerator=comkey+"shift+space")
+        self.acMenuItem = None
         self.editmenu.add_separator()
         self.txtmenu = tk.Menu(self.editmenu, tearoff=0)
         self.txtmenu.add_radiobutton(label="V Large", command=lambda: self.changeTextSize(22))
@@ -818,14 +833,33 @@ class CocoIDE(tk.Frame):
 
         ## Create the assembly code editor panel
         # Text editor with scrollbar and syntax highlighting
-        
+
+        # Scrolled-editor container: text + line numbers + vertical scrollbar
+        # (right edge, full height) + horizontal scrollbar (bottom edge, under
+        # the text only). Previously the bars were grid'ed directly into
+        # mainPanel, which put the H-scrollbar in row 1 / columns 0-1 - i.e.
+        # visually *inside* the editor, across the middle of the window, over
+        # the line-number gutter (user complaint: "полоса прокрутки отображается
+        # не снизу блока редактора, а внутри него посередине").
+        # Layout inside editorWrap:
+        #   row 0 = tab strip, row 1 = [lntext | asstxt | vscroll], row 2 = hbar
+        # The error strip is NOT a child of the text widget any more (a Canvas
+        # placed inside tk.Text lifted itself over the first characters of
+        # every line - user complaint "шкала с ошибками загораживает код").
+        # It now lives in its own thin column (col 0), with lntext at col 1,
+        # so nothing can ever paint over code again.
+        self.editorWrap = tk.Frame(mainPanel)
+        self.editorWrap.grid(row=1, column=1, rowspan=3, sticky="nsew")
+        self.editorWrap.columnconfigure(3, weight=1)   # the Text takes extra width
+        self.editorWrap.rowconfigure(1, weight=1)
+
         # Text Line Number pane
-        self.lntext = tk.Text(mainPanel, width = 4,
+        self.lntext = tk.Text(self.editorWrap, width = 4,
                 padx = 4, highlightthickness = 0,
                 takefocus = 0, bd = 0, background = 'lightgrey',
                 foreground = 'black', font=self.boldfont,
                 yscrollcommand=self.yscroll3)
-        self.lntext.grid(row=1, column=0, sticky="ns")
+        self.lntext.grid(row=1, column=1, sticky="ns")
         self.lntext.config(state="disabled")
         self.lntext.bind('<MouseWheel>', lambda e: "break")
         
@@ -836,10 +870,9 @@ class CocoIDE(tk.Frame):
         # is now created legally in _makeErrStrip(): a uniform highlight
         # border painted in the text background colour + a right-gravity tab
         # stop at col 200 so long comments never run under the red ticks.
-        self.asstxt = tk.Text(mainPanel, wrap=tk.NONE,font=self.defaulttxtfont,
+        self.asstxt = tk.Text(self.editorWrap, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
-                                autoseparators=True, maxundo=-1, width=40,
-                                padx=8)
+                                autoseparators=True, maxundo=-1, width=40)
         # NOTE: do NOT configure custom 'tabs' here. An earlier attempt to
         # reserve a right gutter with a col-200 *right-gravity* tab stop made
         # Tk insert up to ~200 columns of whitespace whenever the user pressed
@@ -850,12 +883,20 @@ class CocoIDE(tk.Frame):
         # pady=(26,0) used to push the editor below the tab strip but ALSO
         # created a dead 26px band between editor and machine-code columns;
         # the tab bar is in its own grid row now, so no offset is needed.
-        self.asstxt.grid(row=1, column=1, sticky="nsew")
-        # Scroll bars
-        self.vscroll = ttk.Scrollbar(mainPanel, orient=tk.VERTICAL, command=self.yview)
-        self.vscroll.grid(row=0, column=2, sticky="ns")
-        txtHscroll = ttk.Scrollbar(mainPanel, orient=tk.HORIZONTAL, command=self.asstxt.xview)
-        txtHscroll.grid(row=1, column=0,columnspan=2, sticky="ew")
+        # padx stays at the Tk default (1px): an earlier fix used padx=22 to
+        # reserve a left gutter for the error strip, but that pushed EVERY
+        # line 22px right of the line-number pane and looked like a dead band
+        # ("между блоками пробел"). The strip now lives in its own grid column
+        # between lntext and the text, so no inner padding is needed.
+        self.asstxt.grid(row=1, column=3, sticky="nsew")
+        # Scroll bars - inside editorWrap: vertical along the RIGHT edge
+        # (full height of the text area), horizontal along the BOTTOM edge
+        # (under the text only). This is what fixes the H-bar appearing
+        # "inside the editor, across the middle".
+        self.vscroll = ttk.Scrollbar(self.editorWrap, orient=tk.VERTICAL, command=self.yview)
+        self.vscroll.grid(row=1, column=4, sticky="ns")
+        txtHscroll = ttk.Scrollbar(self.editorWrap, orient=tk.HORIZONTAL, command=self.asstxt.xview)
+        txtHscroll.grid(row=2, column=3, sticky="ew")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
         # VS Code style error strip (red ticks in a left gutter).
@@ -950,7 +991,7 @@ class CocoIDE(tk.Frame):
         # which is what created the dead ~26px band between the editor and the
         # machine-code column. Row 0 spans columns 1-2 so the vertical
         # scrollbar keeps its full height next to the text.
-        self.editorTabBar.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self.editorTabBar.grid(row=0, column=2, columnspan=3, sticky="ew")
         self.editorTabBar.grid_propagate(False)
         mainPanel.rowconfigure(0, weight=0, minsize=25)   # fixed-height tab strip
         self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
@@ -1039,7 +1080,10 @@ class CocoIDE(tk.Frame):
         self.acWords = []          # current candidate list
         self.acAfterId = None      # id of the debounced KeyRelease handler
         self.acIgnored = False     # True while we modify the buffer ourselves
-        self.acEnabled = True      # toggled via Edit menu / config (restored in loadConfig)
+        # Auto-completion popup is permanently disabled: the user found it
+        # distracting and slower than plain typing. The flag is forced False
+        # here and loadConfig() can no longer re-enable it from old configs.
+        self.acEnabled = False
 
         # Autocomplete key wiring: navigation/accept keys are handled by _acKeyFilter
         # (<Key> binding added further below); Tab is intercepted first so that it
@@ -1070,15 +1114,7 @@ class CocoIDE(tk.Frame):
         # Escape: close the popup first (clearEditorHighlights below is bound
         # with add="+" and only runs when acCancel returns None, i.e. closed).
         self.asstxt.bind("<Escape>", self.acCancel)
-        # Autocomplete trigger (VS Code style). Use lowercase 'space' keysym
-        # and _safeBind: some Tk builds (e.g. python.org 3.14) don't know
-        # the capitalized "Space" keysym and would crash startup otherwise.
-        if platform == "darwin":
-            self._safeBind(self, "<Command-space>", lambda e: self.acTrigger())
-            self._safeBind(self, "<Command-Shift-space>", lambda e: self.acTrigger())
-        else:
-            self._safeBind(self, "<Control-space>", lambda e: self.acTrigger())
-            self._safeBind(self, "<Control-Shift-space>", lambda e: self.acTrigger())
+        # Autocomplete trigger keys removed by user request (popup disabled).
         # Cmd+Shift+P / Ctrl+Shift+P: command palette (VS Code style)
         if platform == "darwin":
             self._safeBind(self, "<Command-Shift-p>", lambda e: self.showCmdPalette())
@@ -1958,26 +1994,52 @@ class CocoIDE(tk.Frame):
             self._pulseBase[w] = base
         else:
             base = self._pulseBase[w]
+        # Guard against a stale after()-id: Tk silently REUSES id numbers once
+        # an id has fired, so after_cancel(old_id) on a dead id can cancel some
+        # UNRELATED callback while our own sequence keeps running - the exact
+        # recipe for the "amber never fades" freeze (r1/r2 stuck yellow). If
+        # the stored id is no longer pending, just let the old sequence finish.
         old = self._pulseIds.get(w)
-        if old:
-            try: self.after_cancel(old)
-            except Exception: pass
+        if old is not None:
+            try:
+                self.after_cancel(old)
+            except Exception:
+                pass
         self._pulseSeq(w, 0, base)
 
-    def _pulseSeq(self, w, i, base):
+    def _pulseSeq(self, w, i, base, old=None):
         try:
             if not w.winfo_exists():
                 self._pulseIds.pop(w, None); self._pulseBase.pop(w, None); return
             if i < len(self._PULSE_STEPS):
                 w.config(bg=self._PULSE_STEPS[i])
-                self._pulseIds[w] = self.after(55, lambda: self._pulseSeq(w, i+1, base))
+                self._pulseIds[w] = self.after(55, lambda: self._pulseSeq(w, i+1, base, self._pulseIds.get(w)))
             else:
-                w.config(bg=base)
-                self._pulseIds.pop(w, None)
-                self._pulseBase.pop(w, None)   # allow re-learning after reset
+                # Fade-back step. If a NEW pulse was started while this chain
+                # was running, _pulseIds[w] no longer holds THIS chain's id -
+                # the newer chain will do its own restore, so we must not
+                # overwrite its bookkeeping (that used to leave the widget
+                # stuck amber forever when two steps raced).
+                aid = self.after(55, lambda: self._pulseFinish(w, base, aid))
+                if self._pulseIds.get(w) is old:
+                    self._pulseIds[w] = aid
         except Exception:
             self._pulseIds.pop(w, None)
             self._pulseBase.pop(w, None)
+
+    def _pulseFinish(self, w, base, myid=None):
+        """Last animation step: restore the resting background exactly once."""
+        try:
+            cur = self._pulseIds.get(w)
+            if myid is not None and cur is not None and cur != myid:
+                return   # a newer chain owns this widget now; it will restore
+            if w.winfo_exists():
+                w.config(bg=base)
+        except Exception:
+            pass
+        finally:
+            self._pulseIds.pop(w, None)
+            self._pulseBase.pop(w, None)   # allow re-learning after reset
 
     def stopAllPulses(self):
         """Cancel every pending animation (halt/stop/reset paths) and restore
@@ -2639,8 +2701,9 @@ class CocoIDE(tk.Frame):
                     self.projectPath = rp
                     self.rootProjectPath = rp
             self._savedExpandedDirs = [p for p in cfg.get("expandedDirs", [])]
-            if "autocomplete" in cfg:
-                self.acEnabled = bool(cfg["autocomplete"])
+            # autocomplete popup is permanently removed - ignore the flag
+            # stored in older config files so it can never come back.
+            self.acEnabled = False
         except Exception:
             pass
 
@@ -3638,8 +3701,7 @@ class CocoIDE(tk.Frame):
             ("Clear Breakpoints", lambda: self.clearBPs(), ""),
             ("Go to Line\u2026", lambda: self.gotoLineDialog(), "Cmd+G"),
             ("Find\u2026", lambda: self.focusSearchBox(), "Cmd+F"),
-            ("Trigger Completion", lambda: self.acTrigger(), "Cmd+Space"),
-            ("Toggle Auto-completion", lambda: self.toggleAutocomplete(), ""),
+            # Auto-completion entries removed by user request.
             ("Reveal Project Folder in Finder", lambda: self.reveal_project_folder(), ""),
             ("Open Terminal in Project Folder", lambda: self.open_terminal_here(), ""),
             ("Close Project", lambda: self.close_project(), ""),
@@ -3772,10 +3834,14 @@ class CocoIDE(tk.Frame):
                 pass
             return "break"
         widget.bind("<Shift-MouseWheel>", onShiftWheel)
-        widget.bind("<Shift-Button-4>", onShiftWheel)
-        widget.bind("<Shift-Button-5>", onShiftWheel)
-        widget.bind("<Button-6>", onHWheel)
-        widget.bind("<Button-7>", onHWheel)
+        # Button-4/5 (Linux wheel up/down) and Button-6/7 (horizontal wheel)
+        # only exist on X11; classic Tk builds for macOS reject them outright,
+        # and some interpreters even raise "bad button number" at bind time.
+        # _safeBind swallows those TclErrors so startup never crashes there.
+        self._safeBind(widget, "<Button-4>", onShiftWheel)
+        self._safeBind(widget, "<Button-5>", onShiftWheel)
+        self._safeBind(widget, "<Button-6>", onHWheel)
+        self._safeBind(widget, "<Button-7>", onHWheel)
 
     #######  Enhanced compiler diagnostics (CDM8)  #######
     # CDM8 operand categories, straight from cocas.iset:
@@ -4316,25 +4382,16 @@ class CocoIDE(tk.Frame):
         return "break"
 
     def _acTabHandler(self, event=None):
-        """<Tab> binding: accept a completion candidate when the popup is
-        open; otherwise fall back to normal Tab behaviour (block indent)."""
-        if self.acIsVisible():
-            return self.acAccept()
+        """<Tab> binding. The completion popup was removed by user request,
+        so Tab now ALWAYS performs normal block indent - it must never be
+        swallowed by leftover popup state."""
         return self.tabBlock(shift=1)
 
     def toggleAutocomplete(self, event=None, refreshOnly=False):
-        if not refreshOnly:
-            self.acEnabled = not self.acEnabled
-        if not self.acEnabled:
-            self.acHide()
-        try:
-            self.menuEdit.entryconfig("Auto-completion",
-                                      label=("Auto-completion   ✔" if self.acEnabled
-                                             else "Auto-completion   "))
-        except Exception:
-            pass
-        if not refreshOnly:
-            self.saveConfig()
+        # Auto-completion is permanently removed by user request; this stub
+        # only keeps old call sites (e.g. __init__ startup) from crashing.
+        self.acEnabled = False
+        self.acHide()
 
     def _acKeyFilter(self, event):
         """Bind on <Key>: intercept navigation/acceptance keys while popup shows."""
@@ -4348,28 +4405,11 @@ class CocoIDE(tk.Frame):
         if not self.acIsVisible():
             return None
         ks = event.keysym
-        # Up/Down ALWAYS move the caret (user complaint). The popup is a
-        # separate toplevel that never steals editor focus, so browsing the
-        # list uses Ctrl/Cmd+arrows or the mouse instead - plain arrows must
-        # never be swallowed here.
-        # Caret navigation keys must NEVER be swallowed by the popup: moving
-        # around while a suggestion list is open simply dismisses it first.
-        # (Previously Left/Right/Home/End/PageUp/PageDown were eaten here, so
-        # horizontal cursor movement appeared broken.)
-        if ks in ("Left", "Right", "Home", "End", "Prior", "Next",
-                  "Page_Up", "Page_Down", "Delete", "BackSpace"):
-            self.acHide()
-            return None
-        if ks == "Tab":
-            # accept only on PLAIN Tab; Shift-Tab = dedent must pass through
-            if not (event.state & (0x1 | 0x8 | 0x40)):   # shift/ctrl/cmd held
-                return self.acAccept()
-            return None
-        if ks == "Return":
-            return self.acAccept()
-        if ks == "Escape":
-            return self.acCancel()
-        return None  # typing continues normally; popup updates via KeyRelease
+        # The completion popup is disabled by user request; even if some old
+        # code path leaves a stale popup around, no editing key (Tab/Return/
+        # arrows) may ever be swallowed here - just dismiss and pass through.
+        self.acHide()
+        return None
 
     def _updateStatusCursor(self, event=None):
         try:
@@ -5274,21 +5314,26 @@ class CocoIDE(tk.Frame):
     # where several errors are far apart and only one is visible at a time.
 
     def _makeErrStrip(self):
-        """VS Code-style diagnostics gutter on the LEFT edge of the editor.
+        """VS Code-style diagnostics gutter as a REAL layout column.
 
-        Earlier revisions floated the strip over the RIGHT edge of the text,
-        where it painted on top of long comments (user complaint). It is now
-        a real gutter: a thin canvas placed inside the text widget's own
-        left margin (relx=0), with the caret/text body starting to the right
-        of it (padx=8 + border on asstxt). Nothing ever overlaps text again.
+        Revision history of this widget:
+        1) floated over the RIGHT edge of the text -> painted on top of long
+           comments (user complaint);
+        2) place()-d inside tk.Text at relx=0 -> a canvas child of a Text is
+           lifted above the text display, so it covered the first characters
+           of every line anyway ("шкала с ошибками загораживает код");
+        3) col 0 of editorWrap -> that column belongs to the LINE-NUMBER
+           pane's span, so the strip landed LEFT of the numbers and looked
+           like it blocked the code again (latest user complaint);
+        4) NOW: its own column BETWEEN the line-number pane (cols 0-1) and
+           the text (now col 3). It can never overlap anything because grid
+           columns don't intersect. Ticks use a soft, blended red so even a
+           future layout bug stays visually harmless.
         """
         bg = self.asstxt.cget("background")
-        self.errStrip = tk.Canvas(None, width=13, background=bg,
+        self.errStrip = tk.Canvas(self.editorWrap, width=13, background=bg,
                                   highlightthickness=0, borderwidth=0)
-        # left gutter: x=0..13 of the text widget interior
-        self.errStrip.place(in_=self.asstxt, relx=0.0, x=0, rely=0.0,
-                            relheight=1.0, relwidth=0.0, width=13)
-        self.errStrip.lift()
+        self.errStrip.grid(row=1, column=2, sticky="ns")
         self.errStrip.bind("<Button-1>", self._errStripClick)
         self.errStrip.bind("<Configure>",
                            lambda e: self._refreshErrMarks())
@@ -5325,10 +5370,18 @@ class CocoIDE(tk.Frame):
             return
         pxPerLine = h / float(total)
         pad = 1 if pxPerLine > 3 else 0
+        # Semi-transparent red ticks (user request: "сделай полупрозрачной").
+        # Tk canvases can't alpha individual items, so the colour is blended
+        # with the strip background instead - looks soft on any theme.
+        try:
+            bgc = c.winfo_toplevel().winfo_rgb(self.asstxt.cget("background"))
+            fill = "#%02x%02x%02x" % tuple((r + 224 * 255) // 288 for r in bgc)
+        except Exception:
+            fill = "#f0a5a5"
         for n in self._errMarkLines:
             y1 = (n - 1) * pxPerLine + pad
             y2 = y1 + max(2.0, min(pxPerLine - 2 * pad, 6.0))
-            c.create_rectangle(2, y1, 12, y2, fill="#e05555", outline="")
+            c.create_rectangle(2, y1, 12, y2, fill=fill, outline="")
             self._errTickPos.append((y1, y2, n))
 
     def _errStripClick(self, event):
