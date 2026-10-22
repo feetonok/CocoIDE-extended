@@ -6,3 +6,4 @@ build/
 *.spec
 CocoIDE.spec
 build_log.txt
+_patch*.py
