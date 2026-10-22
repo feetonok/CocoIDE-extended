@@ -36,7 +36,11 @@ import textwrap
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRY = "cocoideV1.91.pyw"          # main module (also works as plain entry)
 APP_NAME = "CocoIDE"
-DATA_FILES = ["standard.mlb", "sendfile.py", "cocol.py"]
+# All local modules are shipped as data too: the app's resPath() finds them
+# next to the executable inside the bundle, so even code that opens sources
+# from disk (legacy paths) keeps working in the frozen .app.
+DATA_FILES = ["standard.mlb", "sendfile.py", "cocol.py",
+              "cdm8_asm.py", "cdm8_emu.py", "cdm8_io.py", "cocas.py"]
 HIDDEN_IMPORTS = ["cdm8_asm", "cocas", "cdm8_emu", "cdm8_io", "sendfile",
                   "cocol"]  # pyserial is not used by this fork
 
