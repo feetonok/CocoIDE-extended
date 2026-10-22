@@ -796,7 +796,10 @@ class CocoIDE(tk.Frame):
         self.mainPanel = mainPanel
         mainPanel.grid(row=1,column=0, sticky="nsew")
         mainPanel.rowconfigure(0, weight=1)     # Allow text and mcode windows to scale vertically
-        mainPanel.columnconfigure(1, weight=1)  # Allow text and watch windows to scale horizontally
+        # NOTE: the editor column must keep a small minsize: with weight=1 but
+        # no minsize, Tk collapses it to width 0 when the project sidebar +
+        # machine-code + registers columns claim all space (blank editor).
+        mainPanel.columnconfigure(1, weight=1, minsize=340)  # editor column
         
         ## Editor tab strip (VS Code style multiple open files).
         ## It lives in grid row 0 of the editor column and is anchored to the
@@ -822,7 +825,7 @@ class CocoIDE(tk.Frame):
                 takefocus = 0, bd = 0, background = 'lightgrey',
                 foreground = 'black', font=self.boldfont,
                 yscrollcommand=self.yscroll3)
-        self.lntext.grid(row=0, column=0, sticky="ns")
+        self.lntext.grid(row=1, column=0, sticky="ns")
         self.lntext.config(state="disabled")
         self.lntext.bind('<MouseWheel>', lambda e: "break")
         
@@ -835,13 +838,19 @@ class CocoIDE(tk.Frame):
         # stop at col 200 so long comments never run under the red ticks.
         self.asstxt = tk.Text(mainPanel, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
-                                autoseparators=True, maxundo=-1, width=40)
-        try:
-            _tabpx = self.defaulttxtfont.measure("0" * 200) + 32
-            self.asstxt.config(tabs="%g %s right" % (_tabpx, "200c"))
-        except Exception:
-            pass
-        self.asstxt.grid(row=0, column=1, sticky="nsew", pady=(26, 0))
+                                autoseparators=True, maxundo=-1, width=40,
+                                padx=8)
+        # NOTE: do NOT configure custom 'tabs' here. An earlier attempt to
+        # reserve a right gutter with a col-200 *right-gravity* tab stop made
+        # Tk insert up to ~200 columns of whitespace whenever the user pressed
+        # Tab near EOL - horizontal scrolling appeared broken and long comment
+        # lines ran under the error strip again. Standard indent-width tabs
+        # only (set later via tab_width); the error strip lives in the LEFT
+        # gutter (_makeErrStrip), so nothing needs reserving on the right.
+        # pady=(26,0) used to push the editor below the tab strip but ALSO
+        # created a dead 26px band between editor and machine-code columns;
+        # the tab bar is in its own grid row now, so no offset is needed.
+        self.asstxt.grid(row=1, column=1, sticky="nsew")
         # Scroll bars
         self.vscroll = ttk.Scrollbar(mainPanel, orient=tk.VERTICAL, command=self.yview)
         self.vscroll.grid(row=0, column=2, sticky="ns")
@@ -849,26 +858,23 @@ class CocoIDE(tk.Frame):
         txtHscroll.grid(row=1, column=0,columnspan=2, sticky="ew")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
-        # VS Code style error strip (red ticks on the scrollbar gutter).
-        # Created after asstxt exists. It is a narrow canvas placed inside the
-        # editor's own border margin (highlightthickness below), *after* the
-        # right-gravity tab stop at col 200, so long comments can never be
-        # painted over by the strip - see the tabs config above.
+        # VS Code style error strip (red ticks in a left gutter).
         try:
             self._makeErrStrip()
         except Exception:
             pass
 
-        # Up/Down arrows must keep moving the caret even when the completion
-        # popup is open (user complaint: AC module "stole" vertical cursor
-        # movement). Navigation inside the listbox uses Ctrl/Cmd+Up/Down and
-        # mouse clicks instead - exactly how modern IDEs disambiguate this.
-        def _navArrow(event, delta):
-            if self.acIsVisible():
-                return self.acMoveSel(delta)   # popup open -> browse it
-            return None                        # closed -> plain caret movement
-        self.asstxt.bind("<Up>", lambda e: _navArrow(e, -1))
-        self.asstxt.bind("<Down>", lambda e: _navArrow(e, 1))
+        # Up/Down arrows must ALWAYS move the caret (user complaint: "стрелки
+        # вверх/вниз не работают"). The completion popup is a separate toplevel
+        # that never takes keyboard focus, so it cannot legitimately steal the
+        # editor's arrows. Popup navigation therefore uses Ctrl/Cmd+Up/Down and
+        # mouse clicks only - plain Up/Down are no longer intercepted at all.
+        try:
+            if getattr(self, "acAfterId", None):
+                self.after_cancel(self.acAfterId)
+                self.acAfterId = None
+        except Exception:
+            pass
         
         # Status-bar cursor position updates (asstxt exists only from here on)
         self.asstxt.bind("<<CaretMove>>", self._updateStatusCursor, add=True)
@@ -885,11 +891,13 @@ class CocoIDE(tk.Frame):
         # strip). We re-declare both stops in one string now: regular indent
         # tabs first, then the invisible col-200 right stop.
         tab_width = self.defaulttxtfont.measure('OOOO')  # compute desired width of tabs
-        try:
-            _gutter_px = self.defaulttxtfont.measure("0" * 200) + 32
-            _tabspec = "%d %g %s right" % (tab_width, _gutter_px, "200c")
-        except Exception:
-            _tabspec = "%d" % tab_width
+        # Standard indent-width tabs ONLY. The old code also declared a
+        # right-gravity tab stop at "200c" to reserve a gutter for the error
+        # strip; that made Tab near end-of-line insert ~200 columns of
+        # whitespace (horizontal scrolling appeared broken, comments got
+        # pushed off-screen). The error strip is a LEFT gutter now, so no
+        # right-side reservation is needed at all.
+        _tabspec = "%d" % tab_width
         self.asstxt.config(font=self.boldfont, tabs=_tabspec, tabstyle="wordprocessor")#"1.0c 2.0c 3.0c")#tab_width,))
 
         ## Create the machine code memory list display panel
@@ -899,7 +907,10 @@ class CocoIDE(tk.Frame):
         # open in the system viewer but still get a tab). Handy for demoing a
         # task brief next to the code.
         mcodeTabs = ttk.Frame(mainPanel)
-        mcodeTabs.grid(row=0, column=3, sticky="nsew")
+        # Machine code / viewer tabs start at row 1, exactly like the editor:
+        # row 0 belongs to the editor tab strip only. This removes the old
+        # misalignment (and the dead vertical band) between the two columns.
+        mcodeTabs.grid(row=1, column=3, rowspan=2, sticky="nsew")
         mcodeTabs.rowconfigure(1, weight=1)
         mcodeTabs.columnconfigure(0, weight=1)
         self.mcodeTabBar = tk.Frame(mcodeTabs, bg="#e6e6e6", height=24)
@@ -934,11 +945,14 @@ class CocoIDE(tk.Frame):
         self.activeTab = 0
         self._tabSwapGuard = False
         self._savedBuffers = {}      # path -> (content, insert-index) while inactive
-        # The strip widget itself was created earlier (right after mainPanel);
-        # here we just place it. Anchored to the TOP of the editor cell so it
-        # sits directly above the text area without shifting any grid row.
-        self.editorTabBar.grid(row=0, column=1, sticky="n")
+        # The strip lives in its OWN grid row (row 0) directly above the text
+        # area. Previously it was floated over the editor with pady=(26,0),
+        # which is what created the dead ~26px band between the editor and the
+        # machine-code column. Row 0 spans columns 1-2 so the vertical
+        # scrollbar keeps its full height next to the text.
+        self.editorTabBar.grid(row=0, column=1, columnspan=2, sticky="ew")
         self.editorTabBar.grid_propagate(False)
+        mainPanel.rowconfigure(0, weight=0, minsize=25)   # fixed-height tab strip
         self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
 
         # Status/Run time warning/Error pane - a LOG TERMINAL (PyCharm/VS Code
@@ -951,7 +965,9 @@ class CocoIDE(tk.Frame):
         # use a fresh positive row instead of the old row=-1 hack.
         self.logFrame.grid(row=4, column=0, columnspan=4, sticky="nsew")
         mainPanel.rowconfigure(4, weight=0, minsize=96)   # fixed-height terminal
-        mainPanel.columnconfigure(2, weight=0, minsize=240)
+        # NOTE: column 2 is the thin vertical-scrollbar strip between the
+        # editor and the machine-code panel - it must stay narrow (a 240px
+        # reservation here was squeezing the editor into a tiny sliver).
         logHead = tk.Label(self.logFrame, text="  OUTPUT", anchor="w",
                            bg="#2d2d2d", fg="#bbbbbb",
                            font=(self.editorFontName, self.textsize - 2, "bold"))
@@ -1069,6 +1085,11 @@ class CocoIDE(tk.Frame):
         else:
             self._safeBind(self, "<Control-Shift-p>", lambda e: self.showCmdPalette())
         self.asstxt.bind("<FocusOut>", lambda e: self.acHide())
+        # Horizontal scrolling of long lines: Shift+wheel (macOS two-finger +
+        # shift) and Button-6/7 (X11 h-wheel). The bottom scrollbar is clipped
+        # by the watches panel in this layout, so the wheel is the primary way
+        # to reach the right end of a long comment line.
+        self._bindHScroll(self.asstxt)
 
 
         ## Bind mcode keys
@@ -2849,11 +2870,11 @@ class CocoIDE(tk.Frame):
         self._bindMouseWheel(self.projCanvas)
 
         # Insert into the layout as column 0 (editor shifts to column 1 etc.).
-        # The sidebar spans the FULL height of the main panel: its old bottom
-        # neighbour (the Memory Watches block) was moved next to the editor, so
-        # there is no row-2 gap left below it - previously that gap showed up
-        # as an ugly empty square under the tree.
-        panel.grid(row=0, column=0, sticky="nsew", rowspan=5)
+        # The sidebar spans rows 0..3 ONLY - the OUTPUT terminal lives in row 4
+        # and must keep its full width. Before, the panel reached into row 4
+        # too and completely covered the log ("блок проекта загораживает блок
+        # консоли"). Now the console simply starts to the right of the tree.
+        panel.grid(row=0, column=0, sticky="nsew", rowspan=4)
         self.mainPanel.grid_columnconfigure(0, minsize=190)
         # NOTE: do NOT add weight to the sidebar column. The editor column keeps
         # weight=1, so resizing the window never "jitters" the whole layout.
@@ -3730,6 +3751,32 @@ class CocoIDE(tk.Frame):
         widget.bind("<Button-4>", onWheel)
         widget.bind("<Button-5>", onWheel)
 
+    def _bindHScroll(self, widget):
+        """Horizontal wheel scrolling for Text widgets with wrap=NONE.
+        On macOS Shift+two-finger-scroll arrives as <MouseWheel> too; on X11
+        the horizontal wheel is Button-6/7. Without this, long asm lines were
+        effectively unscrollable ('горизонтальная прокрутка не работает')."""
+        def onShiftWheel(event):
+            step = -1 if (getattr(event, "delta", 0) > 0 or
+                          getattr(event, "num", None) == 4) else 1
+            try:
+                widget.xview_scroll(step, "units")
+            except Exception:
+                pass
+            return "break"
+        def onHWheel(event):
+            try:
+                widget.xview_scroll(-1 if getattr(event, "delta", 0) > 0 else 1,
+                                    "units")
+            except Exception:
+                pass
+            return "break"
+        widget.bind("<Shift-MouseWheel>", onShiftWheel)
+        widget.bind("<Shift-Button-4>", onShiftWheel)
+        widget.bind("<Shift-Button-5>", onShiftWheel)
+        widget.bind("<Button-6>", onHWheel)
+        widget.bind("<Button-7>", onHWheel)
+
     #######  Enhanced compiler diagnostics (CDM8)  #######
     # CDM8 operand categories, straight from cocas.iset:
     #   bi  = two register operands      e.g. add rA, rB / ld rA, rB
@@ -4046,6 +4093,18 @@ class CocoIDE(tk.Frame):
         if not getattr(self, "acEnabled", True):
             self.acHide()
             return
+        # Only *typing* may open the popup. Arrow/Home/End/Page keys are pure
+        # caret movement - showing suggestions while the user navigates made
+        # the completion feel like it "steals" the keyboard (user complaint).
+        try:
+            if event is not None and event.keysym in (
+                    "Up", "Down", "Left", "Right", "Home", "End",
+                    "Prior", "Next", "Page_Up", "Page_Down",
+                    "Shift_L", "Shift_R", "Control_L", "Control_R"):
+                self.acHide()
+                return
+        except Exception:
+            pass
         if self.acAfterId:
             try:
                 self.after_cancel(self.acAfterId)
@@ -4084,17 +4143,30 @@ class CocoIDE(tk.Frame):
 
     def _acShowPopup(self):
         if self.acListbox is None:
-            # Parent it to the editor itself: place() coordinates then belong
-            # to asstxt and the popup lands exactly under the caret. (As a
-            # child of the outer frame it was offset by the line-number
-            # gutter + toolbar rows and appeared near the bottom of the app.)
-            self.acListbox = tk.Listbox(self.asstxt, height=8, activestyle="none",
-                                        exportselection=False, relief=tk.RIDGE, bd=1,
-                                        font=self.defaulttxtfont, selectbackground="#1a5fb4",
-                                        selectforeground="white", highlightthickness=1)
-            self.acListbox.bind("<ButtonRelease-1>", self.acSelectClick)
-            self._bindMouseWheel(self.acListbox)
-        lb = self.acListbox
+            # The popup is a borderless, non-focusable TOPLEVEL window placed
+            # in *screen* coordinates right under the caret. (As a child of
+            # asstxt it was clipped to the text widget's own allocation - the
+            # user saw it "somewhere at the bottom" instead of near the
+            # cursor; a Toplevel never gets clipped and can flip above the
+            # caret or sideways near the screen edge.)
+            self.acListbox = tk.Toplevel(self)
+            self.acListbox.overrideredirect(True)      # no title bar/border
+            try:
+                self.acListbox.attributes("-topmost", True)
+            except Exception:
+                pass
+            lbFrame = self.acListbox
+            lb = tk.Listbox(lbFrame, height=8, activestyle="none",
+                            exportselection=False, relief=tk.RIDGE, bd=1,
+                            font=self.defaulttxtfont, selectbackground="#1a5fb4",
+                            selectforeground="white", highlightthickness=1)
+            lb.pack(fill=tk.BOTH, expand=True)
+            lb.bind("<ButtonRelease-1>", self.acSelectClick)
+            self._bindMouseWheel(lb)
+            self.acLbFrame = lbFrame
+        else:
+            lbFrame = self.acListbox
+            lb = lbFrame.winfo_children()[0]
         lb.delete(0, tk.END)
         shown = self.acWords[:8]
         for w in shown:
@@ -4103,45 +4175,43 @@ class CocoIDE(tk.Frame):
         lb.selection_clear(0, tk.END)
         lb.selection_set(0)
         lb.activate(0)
-        # position just below the caret
+        # position just below the caret, in SCREEN coordinates
         try:
             bbox = self.asstxt.bbox(tk.INSERT)
         except tk.TclError:
             bbox = None
-        if bbox:
-            x, y, h, wdt = bbox
-            lb.config(width=max(16, max(len(s) for s in shown) + 6))
-            # coords are relative to asstxt now: caret bbox + its internal
-            # scroll offset (xview/yview give the scrolled-away amount)
-            try:
-                frac_x = float(self.asstxt.xview()[0])
-                frac_y = float(self.asstxt.yview()[0])
-                cw = max(1, int(self.asstxt.cget("width")))
-                ch = max(1, int(self.asstxt.winfo_height()))
-                ox = self.asstxt.winfo_toplevel().winfo_containing(
-                        self.asstxt.winfo_rootx(), self.asstxt.winfo_rooty())
-            except Exception:
-                frac_x = frac_y = 0.0; cw = ch = 1000
-            px = x + frac_x * self.asstxt.winfo_width()
-            py = y + h + frac_y * ch
-            lb.place(x=px, y=py)
-            lb.tkraise()
-            lb.update_idletasks()
-            # flip above the caret if it would run off the bottom of the screen
-            if lb.winfo_rooty() + lb.winfo_height() > self.winfo_screenheight():
-                lb.place(y=y + frac_y * ch - lb.winfo_height())
-            # keep it inside the horizontal bounds of the editor area
-            if lb.winfo_rootx() + lb.winfo_width() > self.winfo_rootx() + self.winfo_width():
-                lb.place(x=max(0, px - lb.winfo_width() + wdt))
+        if not bbox:
+            self.acHide()
+            return
+        x, y, h, wdt = bbox
+        lb.config(width=max(16, max(len(s) for s in shown) + 6))
+        lb.update_idletasks()
+        lw = lb.winfo_reqwidth()
+        lh = lb.winfo_reqheight()
+        gx = self.asstxt.winfo_rootx() + x
+        gy = self.asstxt.winfo_rooty() + y + h          # line below the caret
+        # flip ABOVE the caret when running off the bottom of the screen
+        if gy + lh > self.winfo_screenheight() - 20:
+            gy = self.asstxt.winfo_rooty() + y - lh - 2
+        # keep inside the right screen edge
+        if gx + lw > self.winfo_screenwidth() - 8:
+            gx = max(4, self.winfo_screenwidth() - lw - 8)
+        try:
+            lbFrame.geometry("+%d+%d" % (int(gx), int(gy)))
+            lbFrame.deiconify()
+            lbFrame.lift(self)
+        except Exception:
+            pass
 
     def acIsVisible(self):
-        return self.acListbox is not None and self.acListbox.winfo_exists() \
+        return getattr(self, "acListbox", None) is not None \
+               and self.acListbox.winfo_exists() \
                and self.acListbox.winfo_ismapped()
 
     def acHide(self):
-        if self.acListbox is not None:
+        if getattr(self, "acListbox", None) is not None:
             try:
-                self.acListbox.place_forget()
+                self.acListbox.withdraw()
             except Exception:
                 pass
 
@@ -4213,11 +4283,13 @@ class CocoIDE(tk.Frame):
         return "break"
 
     def acSelectClick(self, event=None):
-        lb = self.acListbox
+        # the toplevel's child Listbox receives the click (event.widget is
+        # never self.acListbox itself any more)
+        lb = event.widget
         sel = lb.nearest(event.y)
         lb.selection_clear(0, tk.END)
         lb.selection_set(sel)
-        self.asstxt.focus_set()
+        self.asstxt.focus_force()
         self.acAccept()
         return "break"
 
@@ -4276,9 +4348,24 @@ class CocoIDE(tk.Frame):
         if not self.acIsVisible():
             return None
         ks = event.keysym
-        if ks in ("Up", "Down"):
-            return self.acMoveSel(1 if ks == "Down" else -1)
-        if ks in ("Tab", "ISO_Left_Tab", "Return"):
+        # Up/Down ALWAYS move the caret (user complaint). The popup is a
+        # separate toplevel that never steals editor focus, so browsing the
+        # list uses Ctrl/Cmd+arrows or the mouse instead - plain arrows must
+        # never be swallowed here.
+        # Caret navigation keys must NEVER be swallowed by the popup: moving
+        # around while a suggestion list is open simply dismisses it first.
+        # (Previously Left/Right/Home/End/PageUp/PageDown were eaten here, so
+        # horizontal cursor movement appeared broken.)
+        if ks in ("Left", "Right", "Home", "End", "Prior", "Next",
+                  "Page_Up", "Page_Down", "Delete", "BackSpace"):
+            self.acHide()
+            return None
+        if ks == "Tab":
+            # accept only on PLAIN Tab; Shift-Tab = dedent must pass through
+            if not (event.state & (0x1 | 0x8 | 0x40)):   # shift/ctrl/cmd held
+                return self.acAccept()
+            return None
+        if ks == "Return":
             return self.acAccept()
         if ks == "Escape":
             return self.acCancel()
@@ -5187,28 +5274,21 @@ class CocoIDE(tk.Frame):
     # where several errors are far apart and only one is visible at a time.
 
     def _makeErrStrip(self):
-        """Create the strip canvas; call once after asstxt/scrollbar exist."""
-        # Reserve a right gutter for the red error ticks. The old code used
-        # padright=26, which is NOT a legal Tk Text option and crashed
-        # startup (TclError) on Python 3.14 / stock macOS Tk. Legal combo:
-        # a uniform highlight border painted in the text background colour
-        # acts as empty padding around the widget (the vertical scrollbar is
-        # a separate widget, so nothing overlaps), plus the right-gravity tab
-        # stop at col 200 configured in __init__ keeps long lines clear of
-        # the tick area.
+        """VS Code-style diagnostics gutter on the LEFT edge of the editor.
+
+        Earlier revisions floated the strip over the RIGHT edge of the text,
+        where it painted on top of long comments (user complaint). It is now
+        a real gutter: a thin canvas placed inside the text widget's own
+        left margin (relx=0), with the caret/text body starting to the right
+        of it (padx=8 + border on asstxt). Nothing ever overlaps text again.
+        """
         bg = self.asstxt.cget("background")
-        try:
-            self.asstxt.config(highlightbackground=bg, highlightcolor=bg,
-                               highlightthickness=6)
-        except Exception:
-            pass
-        self.errStrip = tk.Canvas(None, width=14, background=bg,
+        self.errStrip = tk.Canvas(None, width=13, background=bg,
                                   highlightthickness=0, borderwidth=0)
-        # sits in the gutter *after* the last text column, so a long comment
-        # can never be painted over by the strip itself; only the small red
-        # ticks are drawn on top of the gutter colour
-        self.errStrip.place(in_=self.asstxt, relx=1.0, x=-22, rely=0.0,
-                            relheight=1.0)
+        # left gutter: x=0..13 of the text widget interior
+        self.errStrip.place(in_=self.asstxt, relx=0.0, x=0, rely=0.0,
+                            relheight=1.0, relwidth=0.0, width=13)
+        self.errStrip.lift()
         self.errStrip.bind("<Button-1>", self._errStripClick)
         self.errStrip.bind("<Configure>",
                            lambda e: self._refreshErrMarks())
