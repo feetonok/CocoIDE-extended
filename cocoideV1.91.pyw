@@ -663,7 +663,7 @@ class CocoIDE(tk.Frame):
         # mouse clicks ("nothing works" symptom). Use grid instead.
         buttonBar = tk.Frame(self, name="buttonbar")#, border=1)#, bg="red")
         buttonBar.grid(row=0,column=0, columnspan =4, sticky="ew")
-        buttonBar.columnconfigure(2, weight=1)   # status message stretches
+        buttonBar.columnconfigure(8, weight=1)   # status message stretches
 
         ## Shortcut buttons
         # Editor
@@ -743,23 +743,23 @@ class CocoIDE(tk.Frame):
         self.runEPSelect.pack(side=tk.TOP)
         
         # Cludge for Mac/OSX
+        # NOTE: everything inside buttonBar MUST use grid() - mixing pack() in
+        # the same parent raises TclError ("grid is already managing...").
         if platform == "darwin":
             compileButton = tk.Button(buttonBar, text="Compile/Reset", command=self.compileText, height=3)
         else:
             compileButton = tk.Button(buttonBar, text="Compile\nReset", command=self.compileText, height=3, padx=6)
-        compileButton.pack(side=tk.RIGHT)
+        compileButton.grid(row=0, rowspan=2, column=7, sticky="ns")
         
         # Staus/Run time warning/Error pane
         self.statusMsg=tk.Label(buttonBar, text="", width=20, fg="red", bg="white", 
             height=3,  relief="sunken", border=3, )#int(self.textsize)*2)padx=8,
-        self.statusMsg.pack(side=tk.RIGHT, fill=tk.BOTH, expand=1)
+        self.statusMsg.grid(row=0, rowspan=2, column=8, sticky="nsew")
         
         # AMES extensions
         if amesSession:
-            #self.spacer0=tk.Label(buttonBar, text="", width=1)
-            #self.spacer0.pack(side=tk.LEFT)
             self.amesFrame=tk.Frame(buttonBar, relief="flat", padx=6)
-            self.amesFrame.pack(side=tk.LEFT, expand=0, fill=tk.Y)
+            self.amesFrame.grid(row=0, rowspan=2, column=9, sticky="ns")
             self.amesButton = tk.Button(self.amesFrame, text="Start ", command=self.amesStart)#, height=2)
             self.amesButton.grid(row = 1, column=0, sticky="w")#, rowspan=1)
             self.pinVar = tk.IntVar()
@@ -2939,6 +2939,45 @@ class CocoIDE(tk.Frame):
         m.tk_popup(event.x_root, event.y_root)
         return "break"
 
+    def _showFileMenu(self, event, path):
+        """Right-click (macOS Ctrl-click included) menu for a file row."""
+        m = tk.Menu(self, tearoff=0)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in cf.fileext:
+            m.add_command(label="Open in Editor",
+                          command=lambda p=path: self.file_open(filepath=p))
+        elif ext in (".txt", ".md", ".log", ".obj", ".s"):
+            m.add_command(label="Open in Viewer Tab",
+                          command=lambda p=path: self.openFileInTab(p))
+        else:
+            m.add_command(label="Open with System Viewer",
+                          command=lambda p=path: self.openExternalFile(p))
+        m.add_separator()
+        m.add_command(label="Copy Path",
+                      command=lambda p=path: self._copyToClipboard(p))
+        m.add_command(label="Reveal in Finder" if platform == "darwin"
+                      else "Show in Folder",
+                      command=lambda p=path: self._revealInFinder(p))
+        m.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _copyToClipboard(self, text):
+        try:
+            self.clipboard_clear(); self.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _revealInFinder(self, path):
+        try:
+            if platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            elif platform.startswith("win"):
+                subprocess.Popen(["explorer", "/select,", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception as e:
+            print("reveal failed:", e)
+
     def revealInTree(self, filepath):
         """Expand every ancestor folder of *filepath* inside the tree (root
         stays untouched), highlight the active file and scroll it into view."""
@@ -3104,6 +3143,7 @@ class CocoIDE(tk.Frame):
             mark = "\u25CF " if full == self.file_path else "   "
             lbl = addLabel(mark+name, fg="#0b6e0b", indent=depth,
                            command=lambda e, p=full: self.file_open(filepath=p),
+                           rclick=lambda e, p=full: self._showFileMenu(e, p),
                            tip=lambda f=full: f + "\nClick: open in editor tab")
             if full == self.file_path:
                 lbl.config(font=bold)
@@ -3119,7 +3159,9 @@ class CocoIDE(tk.Frame):
                 act, hint = ("\nClick: open in system viewer",
                              lambda e, p=full: self.openExternalFile(p))
             addLabel("   " + name, fg="#5555aa", indent=depth,
-                     command=hint, tip=lambda f=full, a=act: f + a)
+                     command=hint,
+                     rclick=lambda e, p=full: self._showFileMenu(e, p),
+                     tip=lambda f=full, a=act: f + a)
 
     def openExternalFile(self, filepath):
         """Open non-asm project files (PDF briefs, READMEs...) with the system viewer."""
