@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+.venv-build/
+dist/
+build/
+*.spec
+CocoIDE.spec
+build_log.txt
