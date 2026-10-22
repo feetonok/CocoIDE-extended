@@ -791,7 +791,8 @@ class CocoIDE(tk.Frame):
         ## REMOVED: window-wide status bar (row 3). It added ~22px of vertical
         ## chrome that pushed the right-hand panels (Registers / Memory Watches)
         ## below the visible area on laptop screens. The cursor-position readout
-        ## still exists in the thin editorStatusStrip above the editor instead.
+        ## was removed as well (user request: "удали строку, где отображается
+        ## текущая строка и символ") - see editorStatusStrip = None below.
         self.statusbar = None
         self.cursorLabel = None
         self.fileKindLabel = None
@@ -895,9 +896,19 @@ class CocoIDE(tk.Frame):
         # is now created legally in _makeErrStrip(): a uniform highlight
         # border painted in the text background colour + a right-gravity tab
         # stop at col 200 so long comments never run under the red ticks.
+        # FIXED-WIDTH editor (user request: "добавь ограничение на ширину
+        # строки редактора кода, как у блока машинного кода"). The Text is a
+        # fixed 80 characters wide and is anchored to the LEFT of its grid
+        # cell (sticky="nw"), exactly like mcode_list (width=25). Long lines
+        # no longer paint into the dead space to the right of the text column
+        # - they simply extend past the visible area and are reachable with
+        # the horizontal scrollbar. The vertical scrollbar keeps sticky="ns"
+        # so it still spans the full editor height regardless of text width.
+        self.editorWidthChars = 80
         self.asstxt = tk.Text(self.editorWrap, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
-                                autoseparators=True, maxundo=-1, width=40)
+                                autoseparators=True, maxundo=-1,
+                                width=self.editorWidthChars)
         # NOTE: do NOT configure custom 'tabs' here. An earlier attempt to
         # reserve a right gutter with a col-200 *right-gravity* tab stop made
         # Tk insert up to ~200 columns of whitespace whenever the user pressed
@@ -913,7 +924,11 @@ class CocoIDE(tk.Frame):
         # line 22px right of the line-number pane and looked like a dead band
         # ("между блоками пробел"). The strip now lives in its own grid column
         # between lntext and the text, so no inner padding is needed.
-        self.asstxt.grid(row=1, column=3, sticky="nsew")
+        # sticky="nw" (was "nsew"): the editor keeps its FIXED 80-char width
+        # and is pinned to the top-left of its cell, exactly like the machine
+        # code block. With "nsew" Tk stretched the Text widget to fill the
+        # whole column and long lines ran edge-to-edge with no visible limit.
+        self.asstxt.grid(row=1, column=3, sticky="nw")
         # Scroll bars - inside editorWrap: vertical along the RIGHT edge
         # (full height of the text area), horizontal along the BOTTOM edge
         # (under the text only). This is what fixes the H-bar appearing
@@ -921,7 +936,11 @@ class CocoIDE(tk.Frame):
         self.vscroll = ttk.Scrollbar(self.editorWrap, orient=tk.VERTICAL, command=self.yview)
         self.vscroll.grid(row=1, column=4, sticky="ns")
         txtHscroll = ttk.Scrollbar(self.editorWrap, orient=tk.HORIZONTAL, command=self.asstxt.xview)
-        txtHscroll.grid(row=2, column=3, sticky="ew")
+        # sticky="we" (was "ew"): the bar keeps its natural height and sits at
+        # the BOTTOM edge of row 2, directly under the fixed-width text. With
+        # plain "ew" Tk stretched it vertically across the whole row - which
+        # is what made it look like it was floating inside the editor.
+        txtHscroll.grid(row=2, column=3, sticky="we")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
         # VS Code style error strip (red ticks in a left gutter).
@@ -930,14 +949,13 @@ class CocoIDE(tk.Frame):
         except Exception:
             pass
 
-        # Thin status strip for the editor column (row 0): shows "file : Ln,
-        # Col" like VS Code's bottom-left readout, but placed INSIDE the
-        # editor column so it never collides with the window-wide statusbar.
-        self.editorStatusStrip = tk.Label(mainPanel, text="Ln 1, Col 1",
-                                         anchor="w", bg="#e6e6e6",
-                                         font=self.smallfont, padx=6)
-        self.editorStatusStrip.grid(row=0, column=2, sticky="nsew")
-        mainPanel.columnconfigure(2, weight=0, minsize=70)
+        # REMOVED (user request): the "Ln X, Col Y" strip that used to sit in
+        # row 0 next to the editor tab bar. It occupied a whole grid column
+        # and duplicated information already visible in the caret position.
+        # The old _updateStatusCursor() method is kept as a no-op below so any
+        # leftover bindings never crash.
+        self.editorStatusStrip = None
+        mainPanel.columnconfigure(2, weight=0, minsize=0)
 
         # Up/Down arrows must ALWAYS move the caret (user complaint: "стрелки
         # вверх/вниз не работают"). The completion popup is a separate toplevel
@@ -4461,28 +4479,10 @@ class CocoIDE(tk.Frame):
         return None
 
     def _updateStatusCursor(self, event=None):
-        try:
-            idx = self.asstxt.index(tk.INSERT)
-            ln, col = idx.split(".")
-            sel = ""
-            try:
-                nchars = len(self.asstxt.get("sel.first", "sel.last"))
-                if nchars:
-                    sel = " (%d selected)" % nchars
-            except tk.TclError:
-                pass
-            # Thin readout above the editor (row 0, col 2). The window-wide
-            # status bar was removed to reclaim vertical space on laptops.
-            try:
-                self.editorStatusStrip.config(
-                    text="%s   Ln %s, Col %d%s" % (
-                        self.editorTabs[self.activeTab]["name"]
-                        if getattr(self, "editorTabs", None) else "",
-                        ln, int(col)+1, sel))
-            except Exception:
-                pass
-        except Exception:
-            pass
+        # No-op: the "Ln X, Col Y" strip was removed at the user's request.
+        # Kept so any CaretMove/ButtonRelease/KeyRelease bindings attached to
+        # it never raise AttributeError on older configs.
+        return
 
     def _markCurrentLine(self, event=None):
         try:
