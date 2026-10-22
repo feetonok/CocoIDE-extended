@@ -876,7 +876,11 @@ class CocoIDE(tk.Frame):
         # row 1 ONLY (was rowspan=3): the editor ends exactly where Memory
         # Watches begins - no shared cells, no overlap.
         self.editorWrap.grid(row=1, column=1, sticky="nsew")
-        self.editorWrap.columnconfigure(3, weight=1)   # the Text takes extra width
+        # The Text is FIXED width (80 chars) at column 3; leftover horizontal
+        # space goes to an empty spacer column (4), so the editor block keeps
+        # a crisp right edge like the machine-code pane instead of stretching.
+        self.editorWrap.columnconfigure(3, weight=0)
+        self.editorWrap.columnconfigure(4, weight=1)
         self.editorWrap.rowconfigure(1, weight=1)
 
         # Text Line Number pane
@@ -908,7 +912,8 @@ class CocoIDE(tk.Frame):
         self.asstxt = tk.Text(self.editorWrap, wrap=tk.NONE,font=self.defaulttxtfont,
                                 undo=True, yscrollcommand=self.yscroll1,
                                 autoseparators=True, maxundo=-1,
-                                width=self.editorWidthChars)
+                                width=self.editorWidthChars,
+                                padx=4)
         # NOTE: do NOT configure custom 'tabs' here. An earlier attempt to
         # reserve a right gutter with a col-200 *right-gravity* tab stop made
         # Tk insert up to ~200 columns of whitespace whenever the user pressed
@@ -934,13 +939,13 @@ class CocoIDE(tk.Frame):
         # (under the text only). This is what fixes the H-bar appearing
         # "inside the editor, across the middle".
         self.vscroll = ttk.Scrollbar(self.editorWrap, orient=tk.VERTICAL, command=self.yview)
-        self.vscroll.grid(row=1, column=4, sticky="ns")
+        self.vscroll.grid(row=1, column=5, sticky="ns")
         txtHscroll = ttk.Scrollbar(self.editorWrap, orient=tk.HORIZONTAL, command=self.asstxt.xview)
         # sticky="we" (was "ew"): the bar keeps its natural height and sits at
         # the BOTTOM edge of row 2, directly under the fixed-width text. With
         # plain "ew" Tk stretched it vertically across the whole row - which
         # is what made it look like it was floating inside the editor.
-        txtHscroll.grid(row=2, column=3, sticky="we")
+        txtHscroll.grid(row=2, column=0, columnspan=4, sticky="we")
         self.asstxt.config(xscrollcommand=txtHscroll.set)
 
         # VS Code style error strip (red ticks in a left gutter).
