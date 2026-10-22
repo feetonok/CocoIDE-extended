@@ -788,21 +788,14 @@ class CocoIDE(tk.Frame):
             #    width=25, fg="red", padx=6)#, wrap=tk.WORD)width=25,
             #self.amesStatus.grid(row=0, column=2, rowspan=2, sticky="w")
         
-        ## Status bar (below the main panel): cursor position, file type, project
-        self.statusbar = tk.Frame(self, name="statusbar", bg="#e8e8e8", height=22)
-        # NOTE: row 3, not row 2 - mainPanel occupies row 1; sharing a grid row
-        # made the bar overlap/clip the bottom of the panels above it.
-        self.statusbar.grid(row=3, column=0, sticky="ew")
-        self.statusbar.grid_propagate(False)
-        self.cursorLabel = tk.Label(self.statusbar, text="Ln 1, Col 1", anchor="w",
-                                    bg="#e8e8e8", font=self.smallfont, padx=6)
-        self.cursorLabel.pack(side=tk.RIGHT)
-        self.fileKindLabel = tk.Label(self.statusbar, text="CDM8 Assembly", anchor="e",
-                                      bg="#e8e8e8", font=self.smallfont, padx=6)
-        self.fileKindLabel.pack(side=tk.RIGHT)
-        self.projStatusLabel = tk.Label(self.statusbar, text="No folder", anchor="w",
-                                        bg="#e8e8e8", font=self.smallfont, padx=6)
-        self.projStatusLabel.pack(side=tk.LEFT)
+        ## REMOVED: window-wide status bar (row 3). It added ~22px of vertical
+        ## chrome that pushed the right-hand panels (Registers / Memory Watches)
+        ## below the visible area on laptop screens. The cursor-position readout
+        ## still exists in the thin editorStatusStrip above the editor instead.
+        self.statusbar = None
+        self.cursorLabel = None
+        self.fileKindLabel = None
+        self.projStatusLabel = None
         # NOTE: asstxt is created later in this __init__ (main panel section);
         # the CaretMove bindings are attached there, not here.
 
@@ -836,8 +829,15 @@ class CocoIDE(tk.Frame):
         # NOTE: the editor column must keep a small minsize: with weight=1 but
         # no minsize, Tk collapses it to width 0 when the project sidebar +
         # machine-code + registers columns claim all space (blank editor).
-        mainPanel.columnconfigure(1, weight=3, minsize=340)  # editor column
-        mainPanel.columnconfigure(3, weight=2, minsize=280)  # mcode column
+        # IMPORTANT: these are *minimums*, not fixed sizes - Tk gives every
+        # weighted column its minsize first and only then distributes the rest
+        # of the window by weight. The old values (340/280/90/260 + 190px
+        # sidebar = 1160px) exceeded the width of a 1280px laptop screen, so
+        # the whole layout was clipped on the right and the Registers panel
+        # fell off-screen. Trimmed to fit ~1075px incl. sidebar; anything
+        # beyond that is handled by minsize(960) + horizontal paned fallback.
+        mainPanel.columnconfigure(1, weight=3, minsize=300)  # editor column
+        mainPanel.columnconfigure(3, weight=2, minsize=240)  # mcode column
         
         ## Editor tab strip (VS Code style multiple open files).
         ## It lives in grid row 0 of the editor column and is anchored to the
@@ -937,7 +937,7 @@ class CocoIDE(tk.Frame):
                                          anchor="w", bg="#e6e6e6",
                                          font=self.smallfont, padx=6)
         self.editorStatusStrip.grid(row=0, column=2, sticky="nsew")
-        mainPanel.columnconfigure(2, weight=0, minsize=90)
+        mainPanel.columnconfigure(2, weight=0, minsize=70)
 
         # Up/Down arrows must ALWAYS move the caret (user complaint: "стрелки
         # вверх/вниз не работают"). The completion popup is a separate toplevel
@@ -1297,7 +1297,7 @@ class CocoIDE(tk.Frame):
         self.mcPanel = tk.Frame(mainPanel)#, bg="blue")
         #mcPanel.pack(side=tk.RIGHT, fill=tk.Y)#, expand=1)
         self.mcPanel.grid(row=0, column=4, sticky="nsew", rowspan=4)
-        mainPanel.columnconfigure(4, weight=2, minsize=260)  # memory/IO column
+        mainPanel.columnconfigure(4, weight=2, minsize=230)  # memory/IO column
         self.mcPanel.grid_rowconfigure(index=4, weight=1)
         
         ## Memory Page select frame
@@ -2975,7 +2975,7 @@ class CocoIDE(tk.Frame):
         # too and completely covered the log ("блок проекта загораживает блок
         # консоли"). Now the console simply starts to the right of the tree.
         panel.grid(row=0, column=0, sticky="nsew", rowspan=4)
-        self.mainPanel.grid_columnconfigure(0, minsize=190)
+        self.mainPanel.grid_columnconfigure(0, minsize=170)
         # NOTE: do NOT add weight to the sidebar column. The editor column keeps
         # weight=1, so resizing the window never "jitters" the whole layout.
         self.projPanel = panel
@@ -2995,7 +2995,7 @@ class CocoIDE(tk.Frame):
             self.projVisible = False
         else:
             self.projCanvas.itemconfigure(self.projWin, state="normal")
-            self.mainPanel.grid_columnconfigure(0, minsize=190)
+            self.mainPanel.grid_columnconfigure(0, minsize=170)
             self.projToggle.config(text="▾")
             root = self.rootProjectPath or self.projectPath
             self.projTitle.config(text=(os.path.basename(root).upper()[:16]
@@ -4471,9 +4471,8 @@ class CocoIDE(tk.Frame):
                     sel = " (%d selected)" % nchars
             except tk.TclError:
                 pass
-            self.cursorLabel.config(text="Ln %s, Col %d%s" % (ln, int(col)+1, sel))
-            # Mirror into the editor-column status strip (row 0, col 2) so the
-            # readout is visible right above the code as well.
+            # Thin readout above the editor (row 0, col 2). The window-wide
+            # status bar was removed to reclaim vertical space on laptops.
             try:
                 self.editorStatusStrip.config(
                     text="%s   Ln %s, Col %d%s" % (
@@ -4482,10 +4481,6 @@ class CocoIDE(tk.Frame):
                         ln, int(col)+1, sel))
             except Exception:
                 pass
-            if self.projectPath:
-                self.projStatusLabel.config(text="Folder: " + self.projectPath)
-            else:
-                self.projStatusLabel.config(text="No folder open \u2014 use Project > Open Folder\u2026")
         except Exception:
             pass
 
