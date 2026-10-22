@@ -807,14 +807,37 @@ class CocoIDE(tk.Frame):
         # the CaretMove bindings are attached there, not here.
 
         ### Create mainPanel under buttonBAr
+        # ------------------------------------------------------------------
+        # LAYOUT BLUEPRINT (single consistent grid - this is what fixes the
+        # "one block literally on top of another" regression):
+        #
+        #            col0      col1          col2        col3        col4
+        #   row0  [ projbar ][ editor tabs ][ status strip ][ mcode tabs ]
+        #   row1  [ projbar ][ EDITOR (text+bars+errstrip) ][ MACHINE CODE ]
+        #   row2  [ projbar ][ MEMORY WATCHES              ][ REGISTERS    ]
+        #   row3  [ projbar ][ OUTPUT terminal (full width)               ]
+        #
+        # Rules that used to be violated (overlaps):
+        #  * every panel gets its OWN row/column span - no two widgets may
+        #    share an intersection;
+        #  * rows 1..3 carry the vertical stretch (row1 weight 3, row2/3
+        #    weight 1) so Watches/Registers are real rows UNDER the editor,
+        #    not frames floated on top of it;
+        #  * the editor's own sub-widgets live inside editorWrap, never in
+        #    mainPanel directly.
+        # ------------------------------------------------------------------
         mainPanel = tk.Frame(self, name='cocoidewin')#, bg="yellow")
         self.mainPanel = mainPanel
         mainPanel.grid(row=1,column=0, sticky="nsew")
-        mainPanel.rowconfigure(0, weight=1)     # Allow text and mcode windows to scale vertically
+        mainPanel.rowconfigure(0, weight=0, minsize=25)   # tab strips (fixed)
+        mainPanel.rowconfigure(1, weight=3)               # editor / mcode
+        mainPanel.rowconfigure(2, weight=1)               # watches / registers
+        mainPanel.rowconfigure(3, weight=2)               # OUTPUT terminal
         # NOTE: the editor column must keep a small minsize: with weight=1 but
         # no minsize, Tk collapses it to width 0 when the project sidebar +
         # machine-code + registers columns claim all space (blank editor).
-        mainPanel.columnconfigure(1, weight=1, minsize=340)  # editor column
+        mainPanel.columnconfigure(1, weight=3, minsize=340)  # editor column
+        mainPanel.columnconfigure(3, weight=2, minsize=280)  # mcode column
         
         ## Editor tab strip (VS Code style multiple open files).
         ## It lives in grid row 0 of the editor column and is anchored to the
@@ -849,7 +872,9 @@ class CocoIDE(tk.Frame):
         # It now lives in its own thin column (col 0), with lntext at col 1,
         # so nothing can ever paint over code again.
         self.editorWrap = tk.Frame(mainPanel)
-        self.editorWrap.grid(row=1, column=1, rowspan=3, sticky="nsew")
+        # row 1 ONLY (was rowspan=3): the editor ends exactly where Memory
+        # Watches begins - no shared cells, no overlap.
+        self.editorWrap.grid(row=1, column=1, sticky="nsew")
         self.editorWrap.columnconfigure(3, weight=1)   # the Text takes extra width
         self.editorWrap.rowconfigure(1, weight=1)
 
@@ -905,6 +930,15 @@ class CocoIDE(tk.Frame):
         except Exception:
             pass
 
+        # Thin status strip for the editor column (row 0): shows "file : Ln,
+        # Col" like VS Code's bottom-left readout, but placed INSIDE the
+        # editor column so it never collides with the window-wide statusbar.
+        self.editorStatusStrip = tk.Label(mainPanel, text="Ln 1, Col 1",
+                                         anchor="w", bg="#e6e6e6",
+                                         font=self.smallfont, padx=6)
+        self.editorStatusStrip.grid(row=0, column=2, sticky="nsew")
+        mainPanel.columnconfigure(2, weight=0, minsize=90)
+
         # Up/Down arrows must ALWAYS move the caret (user complaint: "стрелки
         # вверх/вниз не работают"). The completion popup is a separate toplevel
         # that never takes keyboard focus, so it cannot legitimately steal the
@@ -948,10 +982,9 @@ class CocoIDE(tk.Frame):
         # open in the system viewer but still get a tab). Handy for demoing a
         # task brief next to the code.
         mcodeTabs = ttk.Frame(mainPanel)
-        # Machine code / viewer tabs start at row 1, exactly like the editor:
-        # row 0 belongs to the editor tab strip only. This removes the old
-        # misalignment (and the dead vertical band) between the two columns.
-        mcodeTabs.grid(row=1, column=3, rowspan=2, sticky="nsew")
+        # Machine code / viewer tabs: row 1 (UNDER the fixed-height tab strip
+        # row 0), column 3 - a cell of its own, never overlapping the editor.
+        mcodeTabs.grid(row=1, column=3, sticky="nsew")
         mcodeTabs.rowconfigure(1, weight=1)
         mcodeTabs.columnconfigure(0, weight=1)
         self.mcodeTabBar = tk.Frame(mcodeTabs, bg="#e6e6e6", height=24)
@@ -991,9 +1024,11 @@ class CocoIDE(tk.Frame):
         # which is what created the dead ~26px band between the editor and the
         # machine-code column. Row 0 spans columns 1-2 so the vertical
         # scrollbar keeps its full height next to the text.
-        self.editorTabBar.grid(row=0, column=2, columnspan=3, sticky="ew")
+        self.editorTabBar.grid(row=0, column=1, sticky="ew")
         self.editorTabBar.grid_propagate(False)
-        mainPanel.rowconfigure(0, weight=0, minsize=25)   # fixed-height tab strip
+        # NOTE: mainPanel.rowconfigure(0, ...) already set at panel creation
+        # (fixed-height tab strip row) - do not re-tune weights here, that's
+        # what previously fought with the Watches/Registers rows.
         self.asstxt.bind("<<Modified>>", self._onTextModifiedFlag)
 
         # Status/Run time warning/Error pane - a LOG TERMINAL (PyCharm/VS Code
@@ -1001,11 +1036,10 @@ class CocoIDE(tk.Frame):
         # clipped long compiler messages because it lived inside the fixed
         # button bar; now the full diagnostic (with every hint line) is here.
         self.logFrame = tk.Frame(mainPanel, bg="#1e1e1e")
-        # OUTPUT terminal occupies its own grid row (row 4) directly below the
-        # editor/watches area. Negative rows are not supported by Tk, so we
-        # use a fresh positive row instead of the old row=-1 hack.
-        self.logFrame.grid(row=4, column=0, columnspan=4, sticky="nsew")
-        mainPanel.rowconfigure(4, weight=0, minsize=96)   # fixed-height terminal
+        # OUTPUT terminal: row 3 (the LAST mainPanel row), columns 1-3.
+        # It sits UNDER Watches/Registers - nothing can be painted over it
+        # any more. Column 0 belongs to the project sidebar (rows 0..3).
+        self.logFrame.grid(row=3, column=1, columnspan=3, sticky="nsew")
         # NOTE: column 2 is the thin vertical-scrollbar strip between the
         # editor and the machine-code panel - it must stay narrow (a 240px
         # reservation here was squeezing the editor into a tiny sliver).
@@ -1169,8 +1203,10 @@ class CocoIDE(tk.Frame):
         # Bottom strip sits between the editor column (1) and the Registers
         # column (3): the PROJECT sidebar owns the full-height column 0 now,
         # so the watches start at column 1 - no overlap with the tree, and no
-        # empty square left under it.
-        watchPanel.grid(row=2, column=1, columnspan=1, sticky="nsew")
+        # empty square left under it. Row 2 is a REAL grid row that starts
+        # exactly where the editor (row 1) ends - before, editorWrap's
+        # rowspan swallowed this area and Watches painted OVER the code.
+        watchPanel.grid(row=2, column=1, sticky="nsew")
         watchPanel.columnconfigure(0, weight=1)
         #watchPanel.columnconfigure(1, weight=1) 
         # And contents
@@ -1260,7 +1296,8 @@ class CocoIDE(tk.Frame):
         ### Create the machine panel
         self.mcPanel = tk.Frame(mainPanel)#, bg="blue")
         #mcPanel.pack(side=tk.RIGHT, fill=tk.Y)#, expand=1)
-        self.mcPanel.grid(row=0, column=5, sticky="nsew", rowspan=5)#, columnspan=4)
+        self.mcPanel.grid(row=0, column=4, sticky="nsew", rowspan=4)
+        mainPanel.columnconfigure(4, weight=2, minsize=260)  # memory/IO column
         self.mcPanel.grid_rowconfigure(index=4, weight=1)
         
         ## Memory Page select frame
@@ -3036,6 +3073,9 @@ class CocoIDE(tk.Frame):
         else:
             m.add_command(label="Open with System Viewer",
                           command=lambda p=path: self.openExternalFile(p))
+        # Secondary actions available for EVERY file type.
+        m.add_command(label="Open in Viewer Tab",
+                      command=lambda p=path: self.openFileInTab(p))
         m.add_separator()
         m.add_command(label="Copy Path",
                       command=lambda p=path: self._copyToClipboard(p))
@@ -3136,6 +3176,15 @@ class CocoIDE(tk.Frame):
             child.destroy()
         self._projHoverW = None         # old highlighted rows no longer exist
         self.projTreeItems = {}
+        # Layout sanity: the project sidebar must span ALL mainPanel rows
+        # (0..3). If it was ever built with a smaller rowspan, OUTPUT/Watches
+        # would slide left under it and paint over the tree ("пустой квадрат"
+        # / overlap regressions). Re-asserting here keeps every rebuild path
+        # (set_project, refresh button, restore-from-config) consistent.
+        try:
+            self.projPanel.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        except Exception:
+            pass
         bold = (self.editorFontName, self.textsize, "bold")
         norm = (self.editorFontName, self.textsize)
         row = [0]
@@ -4423,6 +4472,16 @@ class CocoIDE(tk.Frame):
             except tk.TclError:
                 pass
             self.cursorLabel.config(text="Ln %s, Col %d%s" % (ln, int(col)+1, sel))
+            # Mirror into the editor-column status strip (row 0, col 2) so the
+            # readout is visible right above the code as well.
+            try:
+                self.editorStatusStrip.config(
+                    text="%s   Ln %s, Col %d%s" % (
+                        self.editorTabs[self.activeTab]["name"]
+                        if getattr(self, "editorTabs", None) else "",
+                        ln, int(col)+1, sel))
+            except Exception:
+                pass
             if self.projectPath:
                 self.projStatusLabel.config(text="Folder: " + self.projectPath)
             else:
